@@ -37,6 +37,7 @@ class OrderStatusUpdatedMail extends Mailable
                 'statusLabel' => $this->statusLabel,
                 'shop' => ShopSettings::public(),
                 'requiresTracking' => $this->order->requiresTrackingNotification(),
+                'siteUrl' => rtrim((string) config('app.url', 'https://mtoys.com.ua'), '/') ?: 'https://mtoys.com.ua',
             ],
         );
     }

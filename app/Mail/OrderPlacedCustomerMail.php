@@ -41,6 +41,7 @@ class OrderPlacedCustomerMail extends Mailable
                 'items' => $this->items,
                 'total' => $this->total,
                 'shop' => ShopSettings::public(),
+                'siteUrl' => rtrim((string) config('app.url', 'https://mtoys.com.ua'), '/') ?: 'https://mtoys.com.ua',
             ],
         );
     }
