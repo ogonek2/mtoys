@@ -9,7 +9,7 @@ import {
     Minus, Plus, Trash2, Image, ShoppingBag, Eye, Package, Award, Handshake,
     Info as InfoIcon, ArrowRight, ArrowLeft, Home, Layers, CreditCard, CircleCheck,
     Boxes, DollarSign, Lightbulb, Box, MapPin, Mail, Clock, Send, SlidersHorizontal,
-    ShieldCheck, RotateCcw, Banknote, Weight, Globe, Factory, Gift, Puzzle,
+    ShieldCheck, RotateCcw, Banknote, Weight, Globe, Factory, Gift, Puzzle, Sparkles,
 } from '@lucide/vue';
 
 const ICON_MAP = {
@@ -62,6 +62,7 @@ const ICON_MAP = {
     factory: Factory,
     gift: Gift,
     puzzle: Puzzle,
+    sparkles: Sparkles,
 };
 
 export default {

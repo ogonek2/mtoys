@@ -2,7 +2,7 @@
     <div class="w-full">
         <div v-if="!loading && items.length > 0"
              data-product-grid
-             class="grid grid-cols-2 gap-3 sm:grid-cols-3 sm:gap-3.5 lg:grid-cols-4 xl:grid-cols-5 xl:gap-4">
+             class="product-grid grid grid-cols-2 gap-3 sm:grid-cols-3 sm:gap-3.5 lg:grid-cols-4 xl:grid-cols-5 xl:gap-4">
             <ProductCardItem
                 v-for="product in items"
                 :key="product.id"

@@ -24,45 +24,56 @@ class SpaPageService
 
     public function homePayload(): array
     {
-        $popularProducts = $this->listing->recommended(10);
+        $popularProducts = \App\Support\Database::retry(
+            fn () => $this->listing->recommended(10)
+        );
 
-        $newProducts = $this->homeRibbonQuery()
-            ->where('created_at', '>=', now()->subDays(60))
-            ->orderByDesc('created_at')
-            ->limit(10)
-            ->get();
+        $newProducts = \App\Support\Database::retry(function () {
+            $items = $this->homeRibbonQuery()
+                ->where('created_at', '>=', now()->subDays(60))
+                ->orderByDesc('created_at')
+                ->limit(10)
+                ->get();
+            $this->listing->attachPrimaryCategory($items);
 
-        $saleProducts = $this->homeRibbonQuery()
-            ->where('discount', '>', 0)
-            ->orderByDesc('discount')
-            ->limit(10)
-            ->get();
+            return $items;
+        });
 
-        $wholesaleProducts = $this->homeRibbonQuery()
-            ->where('is_wholesale', 1)
-            ->orderByDesc('created_at')
-            ->limit(10)
-            ->get();
+        $saleProducts = \App\Support\Database::retry(function () {
+            $items = $this->homeRibbonQuery()
+                ->whereRaw('CAST(discount AS DECIMAL(10,2)) > 0')
+                ->orderByRaw('CAST(discount AS DECIMAL(10,2)) DESC')
+                ->limit(10)
+                ->get();
+            $this->listing->attachPrimaryCategory($items);
 
-        $this->listing->attachPrimaryCategory($newProducts);
-        $this->listing->attachPrimaryCategory($saleProducts);
-        $this->listing->attachPrimaryCategory($wholesaleProducts);
+            return $items;
+        });
 
-        $categories = get_all_category()
-            ->whereNull('parent_id')
-            ->take(12)
-            ->values();
+        $wholesaleProducts = \App\Support\Database::retry(function () {
+            $items = $this->homeRibbonQuery()
+                ->where('is_wholesale', 1)
+                ->orderByDesc('created_at')
+                ->limit(10)
+                ->get();
+            $this->listing->attachPrimaryCategory($items);
 
-        $categoryImages = $this->categoryPreviewImages($categories->pluck('id')->all());
+            return $items;
+        });
 
-        $categories = $categories
-            ->map(function (Category $c) use ($categoryImages) {
-                $data = get_category_card_data($c, $categoryImages[$c->id] ?? null);
+        $categories = \App\Support\Database::retry(function () {
+            $categories = get_all_category()
+                ->whereNull('parent_id')
+                ->take(12)
+                ->values();
 
-                return $data;
-            })
-            ->values()
-            ->all();
+            $categoryImages = $this->categoryPreviewImages($categories->pluck('id')->all());
+
+            return $categories
+                ->map(fn (Category $c) => get_category_card_data($c, $categoryImages[$c->id] ?? null))
+                ->values()
+                ->all();
+        });
 
         return [
             'popularProducts' => $popularProducts instanceof Collection ? $popularProducts->values()->all() : [],
@@ -268,7 +279,12 @@ class SpaPageService
         if ($product->categories->isNotEmpty()) {
             $categoryIds = $product->categories->pluck('id')->all();
             $recommendedProducts = Product::query()
-                ->whereHas('categories', fn ($query) => $query->whereIn('categories.id', $categoryIds))
+                ->whereExists(function ($sub) use ($categoryIds) {
+                    $sub->selectRaw('1')
+                        ->from('category_product')
+                        ->whereColumn('category_product.product_id', 'products.id')
+                        ->whereIn('category_product.category_id', $categoryIds);
+                })
                 ->where('id', '!=', $product->id)
                 ->whereRaw(ProductListingService::IN_STOCK_SQL)
                 ->select([

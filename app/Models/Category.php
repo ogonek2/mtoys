@@ -41,7 +41,6 @@ class Category extends Model
         'is_active',
         'sort_order',
         'meta_image',
-        'description',
     ];
 
     // Отношения

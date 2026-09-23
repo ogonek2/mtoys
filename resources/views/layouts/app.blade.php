@@ -60,6 +60,10 @@
 
         <callback-modal data-action="{{ route('contact_request') }}"></callback-modal>
 
+        <floating-call-button phone="063 63 100 41"></floating-call-button>
+
+        <cookie-consent></cookie-consent>
+
         <toast-notification></toast-notification>
 
     </div>

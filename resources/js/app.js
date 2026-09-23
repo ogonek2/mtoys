@@ -11,6 +11,8 @@ import CartList from './components/CartList.vue';
 import Search from './components/Search.vue';
 import ProductBuyBox from './components/ProductBuyBox.vue';
 import CallbackModal from './components/CallbackModal.vue';
+import FloatingCallButton from './components/FloatingCallButton.vue';
+import CookieConsent from './components/CookieConsent.vue';
 import ProductGallery from './components/ProductGallery.vue';
 import CategoryTreeManager from './components/CategoryTreeManager.vue';
 import CategoryTreeNode from './components/CategoryTreeNode.vue';
@@ -125,6 +127,10 @@ document.addEventListener('DOMContentLoaded', () => {
         mountTag('callback-modal', CallbackModal, (el) => ({
             actionUrl: el.dataset.action || '/contact-request',
         }));
+        mountTag('floating-call-button', FloatingCallButton, (el) => ({
+            phone: el.getAttribute('phone') || '063 63 100 41',
+        }));
+        mountTag('cookie-consent', CookieConsent);
         mountTag('product-gallery', ProductGallery, (el) => ({
             images: safeJsonParse(el.dataset.images, []),
             alt: el.dataset.alt || '',

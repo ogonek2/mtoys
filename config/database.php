@@ -57,8 +57,11 @@ return [
             'collation' => env('DB_COLLATION', 'utf8mb4_unicode_ci'),
             'prefix' => '',
             'prefix_indexes' => true,
-            'strict' => true,
+            // ProxySQL (mysql.tools): USE/SET SESSION sql_mode после коннекта → HY000 2006.
+            'strict' => false,
             'engine' => null,
+            'version' => env('DB_VERSION', '5.7.44'),
+            'use_db_after_connecting' => false,
             'options' => extension_loaded('pdo_mysql') ? array_filter([
                 // ProxySQL на mysql.tools ломает server-side prepared statements (HY093).
                 PDO::ATTR_EMULATE_PREPARES => true,

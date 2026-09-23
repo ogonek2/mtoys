@@ -134,8 +134,29 @@ class ProductListingService
 
         $ids = $this->categoryIdsWithDescendants($category);
 
-        return $query->whereHas('categories', function (Builder $q) use ($ids) {
-            $q->whereIn('categories.id', $ids);
+        return $this->constrainToCategories($query, $ids);
+    }
+
+    /**
+     * ProxySQL-safe замена whereHas('categories').
+     * whereHas генерирует EXISTS (SELECT * …), из-за чего mysql.tools рвёт соединение (HY000 2006).
+     *
+     * @param  list<int>|null  $categoryIds  null = любая категория; [] = пустой результат
+     */
+    public function constrainToCategories(Builder $query, ?array $categoryIds = null): Builder
+    {
+        if (is_array($categoryIds) && $categoryIds === []) {
+            return $query->whereRaw('0 = 1');
+        }
+
+        return $query->whereExists(function ($sub) use ($categoryIds) {
+            $sub->selectRaw('1')
+                ->from('category_product')
+                ->whereColumn('category_product.product_id', 'products.id');
+
+            if (is_array($categoryIds)) {
+                $sub->whereIn('category_product.category_id', $categoryIds);
+            }
         });
     }
 
@@ -183,9 +204,7 @@ class ProductListingService
                 'unit_name_plural',
                 'created_at',
             ])
-            ->whereHas('categories', function (Builder $q) use ($ids) {
-                $q->whereIn('categories.id', $ids);
-            });
+            ->tap(fn (Builder $q) => $this->constrainToCategories($q, $ids));
     }
 
     /**
@@ -267,15 +286,16 @@ class ProductListingService
      */
     public function recommended(int $limit = 12)
     {
-        $products = $this->baseQuery()
-            ->whereHas('categories')
-            ->orderByDesc('id')
-            ->limit($limit)
-            ->get();
+        return \App\Support\Database::retry(function () use ($limit) {
+            $products = $this->constrainToCategories($this->baseQuery())
+                ->orderByDesc('id')
+                ->limit($limit)
+                ->get();
 
-        $this->attachPrimaryCategory($products);
+            $this->attachPrimaryCategory($products);
 
-        return $products;
+            return $products;
+        });
     }
 
     public function attachPrimaryCategory($products): void
@@ -292,16 +312,38 @@ class ProductListingService
             return;
         }
 
-        $collection->loadMissing([
-            'categories' => fn ($query) => $query
-                ->select(['categories.id', 'categories.name', 'categories.url'])
-                ->orderBy('categories.id'),
-        ]);
+        $productIds = $collection->pluck('id')->filter()->map(fn ($id) => (int) $id)->values()->all();
+        if ($productIds === []) {
+            return;
+        }
 
-        $collection->each(function ($product) {
-            $category = $product->categories->first();
-            $product->category_name = $category?->name ?? 'Без категории';
-            $product->category_url = $category?->url ?? 'catalog';
+        // ProxySQL-safe: два простых запроса вместо belongsToMany eager-load (JOIN + SELECT ломает соединение).
+        $pivots = \Illuminate\Support\Facades\DB::table('category_product')
+            ->whereIn('product_id', $productIds)
+            ->orderBy('category_id')
+            ->get(['product_id', 'category_id']);
+
+        $categoryIds = $pivots->pluck('category_id')->unique()->values()->all();
+        $categories = $categoryIds === []
+            ? collect()
+            : \Illuminate\Support\Facades\DB::table('categories')
+                ->whereIn('id', $categoryIds)
+                ->get(['id', 'name', 'url'])
+                ->keyBy('id');
+
+        $primaryByProduct = [];
+        foreach ($pivots as $pivot) {
+            $productId = (int) $pivot->product_id;
+            if (isset($primaryByProduct[$productId])) {
+                continue;
+            }
+            $primaryByProduct[$productId] = $categories->get((int) $pivot->category_id);
+        }
+
+        $collection->each(function ($product) use ($primaryByProduct) {
+            $category = $primaryByProduct[(int) $product->id] ?? null;
+            $product->category_name = $category->name ?? 'Без категории';
+            $product->category_url = $category->url ?? 'catalog';
         });
     }
 }

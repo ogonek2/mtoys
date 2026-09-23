@@ -35,7 +35,7 @@ class MegaMenuService
         return Cache::store($this->cacheStore())->remember(
             self::CACHE_KEY,
             self::CACHE_TTL,
-            fn (): array => $this->build(),
+            fn (): array => \App\Support\Database::retry(fn (): array => $this->build(), 3),
         );
     }
 

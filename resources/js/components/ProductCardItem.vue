@@ -1,50 +1,52 @@
 <template>
     <article
-        class="pcard flex h-full flex-col"
+        class="pcard"
         :class="{ 'pcard--oos': !inStock, 'pcard--in-cart': inCart }">
-        <div class="pcard__media relative aspect-[4/5] sm:aspect-square" :class="{ 'opacity-55 grayscale': !inStock }">
-            <a :href="productUrl" class="block h-full w-full" :title="product.name">
-                <img v-if="product.image_path" :src="product.image_path" :alt="product.name" loading="lazy"
-                    class="h-full w-full object-contain p-2.5 sm:p-3" />
-                <div v-else class="flex h-full w-full items-center justify-center text-gray-300">
-                    <AppIcon name="image" :size="28" />
+        <div class="pcard__media" :class="{ 'pcard__media--oos': !inStock }">
+            <a :href="productUrl" class="pcard__media-link" :title="product.name">
+                <img
+                    v-if="product.image_path"
+                    :src="product.image_path"
+                    :alt="product.name"
+                    loading="lazy"
+                    class="pcard__img" />
+                <div v-else class="pcard__img-empty">
+                    <AppIcon name="image" :size="32" />
                 </div>
             </a>
 
-            <span v-if="product.discount > 0"
-                class="pcard__badge absolute left-2 top-2 bg-[#FF6B4A] px-2 py-0.5 text-[0.625rem] font-bold text-white">
+            <span v-if="product.discount > 0" class="pcard__badge pcard__badge--sale">
                 -{{ product.discount }}%
             </span>
-            <span v-else-if="showNewBadge"
-                class="pcard__badge absolute left-2 top-2 bg-[#FFB703] px-2 py-0.5 text-[0.625rem] font-bold text-[#1A2B36]">
-                New
-            </span>
+            <span v-else-if="showNewBadge" class="pcard__badge pcard__badge--new">NEW</span>
 
-            <span
-                v-if="inCart"
-                class="pcard__badge absolute bottom-2 left-2 bg-[#0E3A45]/90 px-2 py-0.5 text-[0.625rem] font-semibold text-white backdrop-blur-sm">
-                {{ cartQuantity }} у кошику
-            </span>
-
-            <button type="button"
-                class="pcard__wish absolute right-2 top-2 flex h-8 w-8 items-center justify-center text-gray-400 transition-colors"
+            <button
+                type="button"
+                class="pcard__wish"
                 :class="{ 'is-active': inWishlist }"
                 :title="inWishlist ? 'Прибрати з обраного' : 'Додати в обране'"
+                :aria-pressed="inWishlist"
                 @click="handleWishlist">
-                <AppIcon name="heart" :size="15" />
+                <AppIcon name="heart" :size="18" />
             </button>
         </div>
 
-        <div class="pcard__body flex flex-1 flex-col gap-1.5 p-2.5 sm:p-3" :class="{ 'opacity-70': !inStock }">
-            <h3 class="pcard__title">
-                <a :href="productUrl" class="transition-colors hover:text-[#FF6B4A]">{{ product.name }}</a>
-            </h3>
-
-            <div class="pcard__price-row">
-                <span class="pcard__stock-dot" :class="inStock ? 'pcard__stock-dot--yes' : 'pcard__stock-dot--no'" :title="inStock ? 'В наявності' : 'Немає в наявності'"></span>
-                <span class="pcard__price" :class="{ 'pcard__price--empty': !hasPrice }">{{ priceLabel }}</span>
-                <span v-if="hasPrice && product.discount > 0" class="pcard__old">{{ formatPrice(product.price) }}</span>
+        <div class="pcard__body">
+            <div class="pcard__meta">
+                <div v-if="ratingValue > 0" class="pcard__stars" :aria-label="`${ratingValue} з 5`">
+                    <AppIcon
+                        v-for="n in 5"
+                        :key="n"
+                        name="star"
+                        :size="12"
+                        :icon-class="n <= Math.round(ratingValue) ? 'pcard__star pcard__star--on' : 'pcard__star'" />
+                </div>
+                <span v-else class="pcard__reviews">{{ reviewsLabel }}</span>
             </div>
+
+            <h3 class="pcard__title">
+                <a :href="productUrl" :title="product.name">{{ product.name }}</a>
+            </h3>
 
             <button
                 v-if="hasWholesale"
@@ -57,41 +59,11 @@
                 <span class="pcard__wholesale-from">опт · {{ wholesaleMinQty }}+</span>
             </button>
 
-            <div class="pcard__actions mt-auto" :class="{ 'pcard__actions--solo': !inStock }">
-                <div v-if="inStock" class="pcard__qty" title="Кількість">
-                    <button type="button" class="pcard__qty-btn" :disabled="quantity <= 1" aria-label="Зменшити" @click="decreaseQty">
-                        <AppIcon name="minus" :size="14" />
-                    </button>
-                    <label class="pcard__qty-field">
-                        <input
-                            ref="qtyInput"
-                            type="text"
-                            inputmode="numeric"
-                            pattern="[0-9]*"
-                            autocomplete="off"
-                            class="pcard__qty-input"
-                            aria-label="Кількість"
-                            :value="quantityInput"
-                            @keydown="onQtyKeydown"
-                            @paste="onQtyPaste"
-                            @input="onQtyInput"
-                            @keydown.enter.prevent="handleAddToCart"
-                            @blur="normalizeQty" />
-                    </label>
-                    <button type="button" class="pcard__qty-btn" aria-label="Збільшити" @click="increaseQty">
-                        <AppIcon name="plus" :size="14" />
-                    </button>
+            <div class="pcard__price-row">
+                <div class="pcard__price-wrap">
+                    <span class="pcard__price" :class="{ 'pcard__price--empty': !hasPrice }">{{ priceLabel }}</span>
+                    <span v-if="hasPrice && product.discount > 0" class="pcard__old">{{ formatPrice(product.price) }}</span>
                 </div>
-
-                <button type="button"
-                    class="pcard__cart-btn"
-                    :class="inCart ? 'pcard__cart-btn--added' : ''"
-                    :disabled="!inStock"
-                    :title="cartButtonTitle"
-                    @click="handleAddToCart">
-                    <AppIcon name="shopping-cart" :size="16" class="shrink-0" />
-                    <span class="pcard__cart-label">{{ cartButtonLabel }}</span>
-                </button>
             </div>
 
             <button
@@ -101,6 +73,44 @@
                 :title="`Обрати ${boxQty} ${pluralUnitLabel}`"
                 @click="selectBoxQty">
                 Ящик · {{ boxQty }} {{ pluralUnitLabel }}
+            </button>
+        </div>
+
+        <div class="pcard__cart-panel" :class="{ 'pcard__cart-panel--solo': !inStock }">
+            <div v-if="inStock" class="pcard__qty" title="Кількість">
+                <button type="button" class="pcard__qty-btn" :disabled="quantity <= 1" aria-label="Зменшити" @click="decreaseQty">
+                    <AppIcon name="minus" :size="14" />
+                </button>
+                <label class="pcard__qty-field">
+                    <input
+                        ref="qtyInput"
+                        type="text"
+                        inputmode="numeric"
+                        pattern="[0-9]*"
+                        autocomplete="off"
+                        class="pcard__qty-input"
+                        aria-label="Кількість"
+                        :value="quantityInput"
+                        @keydown="onQtyKeydown"
+                        @paste="onQtyPaste"
+                        @input="onQtyInput"
+                        @keydown.enter.prevent="handleAddToCart"
+                        @blur="normalizeQty" />
+                </label>
+                <button type="button" class="pcard__qty-btn" aria-label="Збільшити" @click="increaseQty">
+                    <AppIcon name="plus" :size="14" />
+                </button>
+            </div>
+
+            <button
+                type="button"
+                class="pcard__buy"
+                :class="{ 'pcard__buy--added': inCart }"
+                :disabled="!inStock"
+                :title="cartButtonTitle"
+                @click="handleAddToCart">
+                <AppIcon name="shopping-cart" :size="16" class="shrink-0" />
+                <span>{{ cartButtonLabel }}</span>
             </button>
         </div>
     </article>
@@ -153,9 +163,6 @@ export default {
         quantity() {
             return parseQuantity(this.quantityInput, 1);
         },
-        unitLabel() {
-            return this.product.unit_name || 'шт';
-        },
         pluralUnitLabel() {
             return this.product.unit_name_plural || this.product.unit_name || 'шт';
         },
@@ -174,10 +181,27 @@ export default {
         boxQty() {
             return parseQuantity(this.product.units_per_box, 0);
         },
+        reviewsCount() {
+            const n = Number(this.product.reviews_count ?? this.product.reviews ?? 0);
+            return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+        },
+        ratingValue() {
+            const n = Number(this.product.rating ?? this.product.avg_rating ?? 0);
+            return Number.isFinite(n) && n > 0 ? Math.min(5, n) : 0;
+        },
+        reviewsLabel() {
+            const n = this.reviewsCount;
+            if (n === 0) return '0 відгуків';
+            const mod10 = n % 10;
+            const mod100 = n % 100;
+            if (mod10 === 1 && mod100 !== 11) return `${n} відгук`;
+            if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return `${n} відгуки`;
+            return `${n} відгуків`;
+        },
         cartButtonLabel() {
             if (!this.inStock) return 'Немає';
             if (this.inCart) return `+${this.quantity}`;
-            return 'В кошик';
+            return 'Купити';
         },
         cartButtonTitle() {
             if (!this.inStock) return 'Немає в наявності';
@@ -211,8 +235,7 @@ export default {
             return parseQuantity(fromDom ?? this.quantityInput, 1);
         },
         setQty(value) {
-            const qty = parseQuantity(value, 1);
-            this.quantityInput = String(qty);
+            this.quantityInput = String(parseQuantity(value, 1));
         },
         onQtyInput(event) {
             this.quantityInput = filterQtyInputEvent(event);

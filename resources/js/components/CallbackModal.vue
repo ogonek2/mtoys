@@ -1,12 +1,23 @@
 <template>
     <Teleport to="body">
-        <div v-if="visible" class="callback-modal is-visible" @keydown.esc="close">
+        <div
+            v-if="visible"
+            class="callback-modal is-visible"
+            role="presentation"
+            @keydown.esc.prevent="close">
             <div class="callback-modal__backdrop" @click="close"></div>
-            <div class="callback-modal__dialog" role="dialog" aria-modal="true" aria-labelledby="callback-title">
+            <div
+                ref="dialog"
+                class="callback-modal__dialog"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="callback-title"
+                tabindex="-1"
+                @click.stop>
                 <div class="callback-modal__header">
                     <div>
-                        <h3 id="callback-title" class="callback-modal__title">Замовити консультацію</h3>
-                        <p class="callback-modal__subtitle">Заповніть форму, і ми передзвонимо протягом робочого часу</p>
+                        <h3 id="callback-title" class="callback-modal__title">Замовити дзвінок</h3>
+                        <p class="callback-modal__subtitle">Залиште номер — передзвонимо в робочий час</p>
                     </div>
                     <button type="button" class="callback-modal__close" aria-label="Закрити" @click="close">
                         <AppIcon name="x" :size="22" />
@@ -19,12 +30,14 @@
                         <label class="callback-modal__label">
                             Номер телефону *
                             <input
+                                ref="phoneInput"
                                 v-model="form.phone"
                                 type="tel"
                                 required
+                                autocomplete="tel"
                                 class="callback-modal__input"
-                                placeholder="063 63 100 41"
-                                @input="formatPhone">
+                                placeholder="+380 (__ ) ___ __ __"
+                                @input="onPhoneInput">
                         </label>
                         <label class="callback-modal__label">
                             Повідомлення <span class="callback-modal__optional">(необов'язково)</span>
@@ -56,43 +69,81 @@ export default {
             success: '',
             error: '',
             form: { phone: '', message: '' },
+            openHandlers: [],
         };
     },
     mounted() {
-        document.querySelectorAll('[data-callback-open]').forEach((el) => {
-            el.addEventListener('click', (e) => {
-                e.preventDefault();
-                this.open();
-            });
-        });
+        this.bindOpenTriggers();
         window.openCallbackModal = () => this.open();
         window.closeCallbackModal = () => this.close();
     },
+    beforeUnmount() {
+        this.unbindOpenTriggers();
+        if (this.visible) {
+            document.body.style.overflow = '';
+        }
+        if (window.openCallbackModal) delete window.openCallbackModal;
+        if (window.closeCallbackModal) delete window.closeCallbackModal;
+    },
     methods: {
+        bindOpenTriggers() {
+            this.unbindOpenTriggers();
+            const handler = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this.open();
+            };
+            document.querySelectorAll('[data-callback-open]').forEach((el) => {
+                el.addEventListener('click', handler);
+                this.openHandlers.push({ el, handler });
+            });
+        },
+        unbindOpenTriggers() {
+            this.openHandlers.forEach(({ el, handler }) => {
+                el.removeEventListener('click', handler);
+            });
+            this.openHandlers = [];
+        },
         open() {
             this.success = '';
             this.error = '';
             this.form = { phone: '', message: '' };
             this.visible = true;
             document.body.style.overflow = 'hidden';
+            this.$nextTick(() => {
+                this.$refs.dialog?.focus?.();
+                this.$refs.phoneInput?.focus?.();
+            });
         },
         close() {
             this.visible = false;
+            this.loading = false;
             document.body.style.overflow = '';
         },
-        formatPhone() {
-            const digits = this.form.phone.replace(/\D/g, '').slice(0, 12);
-            if (!digits.startsWith('380') && digits.length) {
-                this.form.phone = '+380';
+        onPhoneInput(event) {
+            const raw = String(event?.target?.value ?? this.form.phone);
+            let digits = raw.replace(/\D/g, '');
+
+            if (digits.startsWith('0')) {
+                digits = `38${digits}`;
+            }
+            if (!digits.startsWith('380') && digits.length > 0) {
+                digits = `380${digits.replace(/^380?/, '')}`;
+            }
+
+            digits = digits.slice(0, 12);
+            if (!digits) {
+                this.form.phone = '';
                 return;
             }
+
             let out = '+380';
             const rest = digits.slice(3);
             if (rest.length > 0) out += ` (${rest.slice(0, 2)}`;
             if (rest.length >= 2) out += `) ${rest.slice(2, 5)}`;
             if (rest.length >= 5) out += ` ${rest.slice(5, 7)}`;
             if (rest.length >= 7) out += ` ${rest.slice(7, 9)}`;
-            this.form.phone = out.trim();
+            this.form.phone = out;
         },
         async refreshCsrfToken() {
             try {
@@ -106,7 +157,7 @@ export default {
                     if (meta) meta.setAttribute('content', data.token);
                     return data.token;
                 }
-            } catch (e) {
+            } catch {
                 // fall through
             }
             return document.querySelector('meta[name="csrf-token"]')?.content || '';
