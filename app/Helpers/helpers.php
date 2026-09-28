@@ -219,58 +219,25 @@ if (!function_exists('get_mega_menu_data')) {
 
 function uploadToBunnyCDN($localFilePath, $destinationPath)
 {
-    $storageName = env('BUNNY_STORAGE_NAME');
-    $password = env('BUNNY_STORAGE_PASSWORD');
-    $region = env('BUNNY_STORAGE_REGION', 'de');
-
-    // Проверяем существование файла
-    if (!file_exists($localFilePath)) {
-        throw new \Exception("File not found: " . $localFilePath);
+    // Legacy wrapper: FileUploadHelper сам генерирует имя; для явного пути используем прямой API.
+    $helper = \App\Helpers\FileUploadHelper::class;
+    if (! is_readable($localFilePath)) {
+        throw new \Exception('File not found: '.$localFilePath);
     }
 
-    $url = "https://storage.bunnycdn.com/{$storageName}/{$destinationPath}";
+    $folder = trim(dirname($destinationPath), '/.');
+    $uploaded = $helper::uploadToBunnyCDN($localFilePath, $folder !== '' ? $folder : 'products');
+    if (! $uploaded) {
+        throw new \Exception('BunnyCDN upload failed');
+    }
 
-    // Используем cURL для более надежной загрузки бинарных файлов
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $url);
-    curl_setopt($ch, CURLOPT_PUT, true);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        'AccessKey: ' . $password,
-        'Content-Type: application/octet-stream',
-    ]);
-    
-    // Отключаем проверку SSL в среде разработки
-    if (env('APP_ENV') !== 'production') {
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-    }
-    
-    // Открываем файл для чтения
-    $fileHandle = fopen($localFilePath, 'rb');
-    if (!$fileHandle) {
-        curl_close($ch);
-        throw new \Exception("Cannot open file: " . $localFilePath);
-    }
-    
-    curl_setopt($ch, CURLOPT_INFILE, $fileHandle);
-    curl_setopt($ch, CURLOPT_INFILESIZE, filesize($localFilePath));
-    
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $error = curl_error($ch);
-    
-    fclose($fileHandle);
-    curl_close($ch);
-    
-    if ($error) {
-        throw new \Exception("cURL error: " . $error);
-    }
-    
-    if ($httpCode >= 200 && $httpCode < 300) {
-        return env('BUNNY_CDN_URL') . '/' . $destinationPath;
-    } else {
-        throw new \Exception("Upload failed with HTTP code: " . $httpCode . " Response: " . $response);
+    return $uploaded;
+}
+
+if (! function_exists('shop_image_url')) {
+    function shop_image_url(?string $path, ?string $fallback = null): string
+    {
+        return \App\Helpers\FileUploadHelper::publicUrl($path, $fallback);
     }
 }
 

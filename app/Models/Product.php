@@ -232,28 +232,25 @@ class Product extends Model
     // Получить путь к изображению (с поддержкой CDN)
     public function getImagePath()
     {
-        if (!$this->image_path) {
-            return asset('dist/img/no-image.png'); // Fallback изображение
+        return \App\Helpers\FileUploadHelper::publicUrl($this->image_path);
+    }
+
+    /**
+     * Витрина/JSON всегда получают абсолютный URL картинки.
+     *
+     * @return array<string, mixed>
+     */
+    public function toArray()
+    {
+        $array = parent::toArray();
+
+        if (array_key_exists('image_path', $array)) {
+            $array['image_path'] = \App\Helpers\FileUploadHelper::publicUrl(
+                is_string($array['image_path'] ?? null) ? $array['image_path'] : $this->image_path
+            );
         }
 
-        // Если путь уже содержит полный URL (например, из CDN)
-        if (str_starts_with($this->image_path, 'http://') || str_starts_with($this->image_path, 'https://')) {
-            return $this->image_path;
-        }
-
-        // Проверяем, есть ли изображение в локальном хранилище
-        $localPath = storage_path('app/public/' . $this->image_path);
-        if (file_exists($localPath)) {
-            return asset('storage/' . $this->image_path);
-        }
-
-        // Если изображение на CDN (BunnyCDN)
-        if (config('app.cdn_url')) {
-            return config('app.cdn_url') . '/' . $this->image_path;
-        }
-
-        // Fallback на storage
-        return asset('storage/' . $this->image_path);
+        return $array;
     }
 
     protected static function booted()

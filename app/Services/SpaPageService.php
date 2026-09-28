@@ -123,7 +123,7 @@ class SpaPageService
         foreach ($rows as $row) {
             $categoryId = (int) $row->category_id;
             if (! isset($images[$categoryId])) {
-                $images[$categoryId] = $row->image_path;
+                $images[$categoryId] = \App\Helpers\FileUploadHelper::publicUrl($row->image_path);
             }
         }
 
@@ -265,11 +265,12 @@ class SpaPageService
 
         $allImages = [];
         if ($product->image_path) {
-            $allImages[] = $product->image_path;
+            $allImages[] = \App\Helpers\FileUploadHelper::publicUrl($product->image_path);
         }
         foreach ($images as $image) {
-            if (! in_array($image->src, $allImages, true)) {
-                $allImages[] = $image->src;
+            $url = \App\Helpers\FileUploadHelper::publicUrl($image->src);
+            if ($url && ! in_array($url, $allImages, true)) {
+                $allImages[] = $url;
             }
         }
 
@@ -327,7 +328,7 @@ class SpaPageService
                 'price' => $product->price,
                 'discount' => $product->discount,
                 'finalPrice' => $finalPrice,
-                'image_path' => $product->image_path,
+                'image_path' => \App\Helpers\FileUploadHelper::publicUrl($product->image_path),
                 'availability' => $product->availability,
                 'inStock' => $inStock,
                 'is_wholesale' => $product->is_wholesale,
@@ -353,7 +354,7 @@ class SpaPageService
                 'name' => $product->name,
                 'price' => $product->price,
                 'discount' => $product->discount,
-                'image_path' => $product->image_path,
+                'image_path' => \App\Helpers\FileUploadHelper::publicUrl($product->image_path),
                 'articule' => $product->articule,
                 'availability' => $product->availability,
                 'is_wholesale' => $product->is_wholesale,

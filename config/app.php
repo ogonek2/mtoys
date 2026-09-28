@@ -123,4 +123,11 @@ return [
         'store' => env('APP_MAINTENANCE_STORE', 'database'),
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Public CDN base URL (BunnyCDN pull zone)
+    |--------------------------------------------------------------------------
+    */
+    'cdn_url' => env('BUNNY_CDN_URL', env('CDN_URL', '')),
+
 ];

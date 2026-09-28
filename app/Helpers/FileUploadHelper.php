@@ -2,132 +2,250 @@
 
 namespace App\Helpers;
 
-use Illuminate\Support\Str;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Throwable;
 
 class FileUploadHelper
 {
     /**
-     * Загружает файл на BunnyCDN и возвращает публичный URL.
+     * Публичный URL картинки для витрины / админки.
      *
-     * @param \Illuminate\Http\UploadedFile $file
-     * @param string $folder - папка для хранения, например 'products'
-     * @return string|null - публичный URL или null при ошибке
+     * - http(s) / //… — внешние ссылки импорта, отдаём как есть (не через Bunny);
+     * - products/… — локально или BunnyCDN;
+     * - пусто — fallback.
      */
-    public static function uploadToBunnyCDN($file, $folder = 'products')
+    public static function publicUrl(?string $path, ?string $fallback = null): string
+    {
+        $fallback ??= asset('dist/img/no-image.png');
+        $path = trim((string) $path);
+
+        if ($path === '') {
+            return $fallback;
+        }
+
+        // Protocol-relative CDN/host from imports
+        if (str_starts_with($path, '//')) {
+            return 'https:'.$path;
+        }
+
+        // Absolute external or own CDN URL — never rewrite foreign hosts
+        if (str_starts_with($path, 'http://') || str_starts_with($path, 'https://')) {
+            return $path;
+        }
+
+        $relative = ltrim($path, '/');
+        if (str_starts_with($relative, 'storage/')) {
+            $relative = substr($relative, strlen('storage/'));
+        }
+
+        $localRelative = $relative;
+        if (Storage::disk('public')->exists($localRelative)) {
+            return Storage::disk('public')->url($localRelative);
+        }
+
+        $cdn = self::cdnBaseUrl();
+        if ($cdn !== '') {
+            return $cdn.'/'.$relative;
+        }
+
+        return asset('storage/'.$relative);
+    }
+
+    public static function isExternalUrl(?string $path): bool
+    {
+        $path = trim((string) $path);
+        if ($path === '') {
+            return false;
+        }
+
+        if (str_starts_with($path, '//')) {
+            return true;
+        }
+
+        if (! str_starts_with($path, 'http://') && ! str_starts_with($path, 'https://')) {
+            return false;
+        }
+
+        $cdn = self::cdnBaseUrl();
+
+        return $cdn === '' || ! str_starts_with($path, $cdn);
+    }
+
+    public static function cdnBaseUrl(): string
+    {
+        return rtrim((string) config('services.bunny.cdn_url', config('app.cdn_url', '')), '/');
+    }
+
+    public static function isConfigured(): bool
+    {
+        return self::cdnBaseUrl() !== ''
+            && (string) config('services.bunny.storage_name', '') !== ''
+            && (string) config('services.bunny.storage_password', '') !== '';
+    }
+
+    public static function storageApiBaseUrl(): string
+    {
+        $region = strtolower(trim((string) config('services.bunny.region', '')));
+
+        $hosts = [
+            '' => 'https://storage.bunnycdn.com',
+            'de' => 'https://storage.bunnycdn.com',
+            'fs' => 'https://storage.bunnycdn.com',
+            'falkenstein' => 'https://storage.bunnycdn.com',
+            'uk' => 'https://uk.storage.bunnycdn.com',
+            'ny' => 'https://ny.storage.bunnycdn.com',
+            'la' => 'https://la.storage.bunnycdn.com',
+            'sg' => 'https://sg.storage.bunnycdn.com',
+            'se' => 'https://se.storage.bunnycdn.com',
+            'br' => 'https://br.storage.bunnycdn.com',
+            'jh' => 'https://jh.storage.bunnycdn.com',
+            'syd' => 'https://syd.storage.bunnycdn.com',
+        ];
+
+        if (isset($hosts[$region])) {
+            return $hosts[$region];
+        }
+
+        return 'https://'.$region.'.storage.bunnycdn.com';
+    }
+
+    /**
+     * @param  UploadedFile|string  $file  UploadedFile или абсолютный путь к файлу
+     */
+    public static function uploadToBunnyCDN($file, string $folder = 'products'): ?string
     {
         try {
-            // Проверяем наличие необходимых переменных окружения
-            if (!env('BUNNY_STORAGE_NAME') || !env('BUNNY_STORAGE_PASSWORD') || !env('BUNNY_CDN_URL')) {
-                \Log::error('Отсутствуют настройки BunnyCDN в .env файле');
+            if (! self::isConfigured()) {
+                Log::error('BunnyCDN: отсутствуют BUNNY_* настройки в .env / config');
+
                 return null;
             }
 
-            $extension = $file->getClientOriginalExtension();
-            $fileName = Str::random(20) . '.' . $extension;
-            $destinationPath = $folder . '/' . $fileName;
+            if ($file instanceof UploadedFile) {
+                $extension = $file->getClientOriginalExtension() ?: $file->extension() ?: 'jpg';
+                $realPath = $file->getRealPath();
+            } else {
+                $realPath = (string) $file;
+                $extension = pathinfo($realPath, PATHINFO_EXTENSION) ?: 'jpg';
+            }
 
-            $fileContents = file_get_contents($file->getRealPath());
+            if (! $realPath || ! is_readable($realPath)) {
+                Log::error('BunnyCDN: файл недоступен для чтения', ['path' => $realPath]);
 
-            $url = "https://storage.bunnycdn.com/" . env('BUNNY_STORAGE_NAME') . "/$destinationPath";
+                return null;
+            }
 
-            \Log::info('Попытка загрузки на BunnyCDN', [
-                'url' => $url,
-                'folder' => $folder,
-                'fileName' => $fileName,
-                'fileSize' => strlen($fileContents)
-            ]);
+            $fileName = Str::random(20).'.'.strtolower($extension);
+            $destinationPath = trim($folder, '/').'/'.$fileName;
+            $fileContents = file_get_contents($realPath);
+            if ($fileContents === false) {
+                return null;
+            }
 
-            $response = Http::withHeaders([
-                'AccessKey' => env('BUNNY_STORAGE_PASSWORD'),
-                'Content-Type' => 'application/octet-stream',
-            ])->withBody($fileContents, 'application/octet-stream')
+            $url = self::storageApiBaseUrl().'/'.config('services.bunny.storage_name').'/'.$destinationPath;
+
+            $response = Http::timeout(60)
+                ->withHeaders([
+                    'AccessKey' => (string) config('services.bunny.storage_password'),
+                    'Content-Type' => 'application/octet-stream',
+                ])
+                ->withBody($fileContents, 'application/octet-stream')
                 ->put($url);
 
-            \Log::info('Ответ от BunnyCDN', [
-                'status' => $response->status(),
-                'body' => $response->body()
-            ]);
-
-            if ($response->successful()) {
-                $publicUrl = rtrim(env('BUNNY_CDN_URL'), '/') . '/' . $destinationPath;
-                \Log::info('Файл успешно загружен на BunnyCDN', ['publicUrl' => $publicUrl]);
-                return $publicUrl;
-            } else {
-                \Log::error('Ошибка загрузки на BunnyCDN', [
+            if (! $response->successful()) {
+                Log::error('BunnyCDN upload failed', [
                     'status' => $response->status(),
                     'body' => $response->body(),
-                    'headers' => $response->headers()
+                    'url' => $url,
                 ]);
+
                 return null;
             }
 
-        } catch (\Exception $e) {
-            \Log::error('Исключение при загрузке на BunnyCDN: ' . $e->getMessage(), [
+            $publicUrl = self::cdnBaseUrl().'/'.$destinationPath;
+            Log::info('BunnyCDN upload ok', ['publicUrl' => $publicUrl]);
+
+            return $publicUrl;
+        } catch (Throwable $e) {
+            Log::error('BunnyCDN upload exception: '.$e->getMessage(), [
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
-                'trace' => $e->getTraceAsString()
             ]);
+
             return null;
         }
     }
 
-    public static function deleteFromBunnyCDN($url)
+    public static function deleteFromBunnyCDN(?string $url): bool
     {
-        $parsed = parse_url($url);
-        $path = ltrim($parsed['path'], '/');
+        $url = trim((string) $url);
+        if ($url === '' || ! self::isConfigured()) {
+            return false;
+        }
 
-        return Http::withHeaders([
-            'AccessKey' => env('BUNNY_STORAGE_PASSWORD'),
-            'Content-Type' => 'application/octet-stream',
-        ])->delete("https://storage.bunnycdn.com/" . env('BUNNY_STORAGE_NAME') . "/" . $path)->successful();
+        $cdn = self::cdnBaseUrl();
+        $path = $url;
+
+        if (str_starts_with($url, 'http://') || str_starts_with($url, 'https://')) {
+            if ($cdn === '' || ! str_starts_with($url, $cdn)) {
+                return false;
+            }
+            $parsed = parse_url($url);
+            $path = ltrim((string) ($parsed['path'] ?? ''), '/');
+        } else {
+            $path = ltrim($url, '/');
+        }
+
+        if ($path === '') {
+            return false;
+        }
+
+        try {
+            return Http::timeout(30)
+                ->withHeaders([
+                    'AccessKey' => (string) config('services.bunny.storage_password'),
+                ])
+                ->delete(self::storageApiBaseUrl().'/'.config('services.bunny.storage_name').'/'.$path)
+                ->successful();
+        } catch (Throwable $e) {
+            Log::error('BunnyCDN delete exception: '.$e->getMessage());
+
+            return false;
+        }
     }
 
-    /**
-     * Альтернативный метод загрузки файлов локально
-     */
-    public static function uploadLocally($file, $folder = 'products')
+    public static function uploadLocally(UploadedFile $file, string $folder = 'products'): ?string
     {
         try {
-            $extension = $file->getClientOriginalExtension();
-            $fileName = Str::random(20) . '.' . $extension;
-            $destinationPath = "storage/app/public/$folder";
-            
-            // Создаем директорию если её нет
-            if (!file_exists($destinationPath)) {
-                mkdir($destinationPath, 0755, true);
-            }
-            
-            $fullPath = $destinationPath . '/' . $fileName;
-            
-            if (move_uploaded_file($file->getRealPath(), $fullPath)) {
-                $publicUrl = asset("storage/$folder/$fileName");
-                \Log::info('Файл успешно загружен локально', ['publicUrl' => $publicUrl]);
-                return $publicUrl;
-            }
-            
-            return null;
-            
-        } catch (\Exception $e) {
-            \Log::error('Ошибка локальной загрузки: ' . $e->getMessage());
+            $extension = $file->getClientOriginalExtension() ?: 'jpg';
+            $fileName = Str::random(20).'.'.strtolower($extension);
+            $stored = $file->storeAs(trim($folder, '/'), $fileName, 'public');
+
+            return $stored ? self::publicUrl($stored) : null;
+        } catch (Throwable $e) {
+            Log::error('Local upload error: '.$e->getMessage());
+
             return null;
         }
     }
 
-    /**
-     * Универсальный метод загрузки файлов
-     */
-    public static function uploadFile($file, $folder = 'products')
+    public static function uploadFile($file, string $folder = 'products'): ?string
     {
-        // Сначала пробуем загрузить на CDN
         $cdnUrl = self::uploadToBunnyCDN($file, $folder);
-        
         if ($cdnUrl) {
             return $cdnUrl;
         }
-        
-        // Если CDN недоступен, загружаем локально
-        \Log::warning('CDN недоступен, используем локальную загрузку');
-        return self::uploadLocally($file, $folder);
+
+        if ($file instanceof UploadedFile) {
+            Log::warning('BunnyCDN недоступен, fallback на локальное хранилище');
+
+            return self::uploadLocally($file, $folder);
+        }
+
+        return null;
     }
 }

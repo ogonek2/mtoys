@@ -9,7 +9,9 @@ use Filament\Actions\CreateAction;
 use Filament\Actions\DeleteAction;
 use Filament\Actions\DeleteBulkAction;
 use Filament\Actions\EditAction;
+use Filament\Forms\Components\TextInput;
 use Filament\Resources\RelationManagers\RelationManager;
+use Filament\Schemas\Components\Utilities\Set;
 use Filament\Schemas\Schema;
 use Filament\Tables\Columns\ImageColumn;
 use Filament\Tables\Columns\TextColumn;
@@ -29,9 +31,25 @@ class ImagesRelationManager extends RelationManager
     {
         return $schema
             ->components([
-                ShopImageUpload::make('src')
-                    ->label('Изображение')
+                ShopImageUpload::make('image_upload')
+                    ->label('Завантажити на BunnyCDN')
+                    ->dehydrated(false)
+                    ->afterStateUpdated(function (mixed $state, Set $set): void {
+                        if (is_array($state)) {
+                            $state = $state[0] ?? null;
+                        }
+                        if (is_string($state) && trim($state) !== '') {
+                            $set('src', trim($state));
+                        }
+                    })
+                    ->helperText('Файл на CDN або залиште порожнім і вставте зовнішнє посилання нижче.')
+                    ->columnSpanFull(),
+
+                TextInput::make('src')
+                    ->label('Посилання на зображення')
+                    ->placeholder('https://example.com/photo.jpg')
                     ->required()
+                    ->helperText('Зовнішній URL з імпорту або CDN-посилання після завантаження.')
                     ->columnSpanFull(),
             ]);
     }

@@ -48,4 +48,11 @@ return [
         'verify_ssl' => filter_var(env('TG_VERIFY_SSL', false), FILTER_VALIDATE_BOOLEAN),
     ],
 
+    'bunny' => [
+        'storage_name' => env('BUNNY_STORAGE_NAME', ''),
+        'storage_password' => env('BUNNY_STORAGE_PASSWORD', ''),
+        'region' => env('BUNNY_STORAGE_REGION', 'de'),
+        'cdn_url' => env('BUNNY_CDN_URL', ''),
+    ],
+
 ];
