@@ -2,7 +2,7 @@
 
 namespace App\Filament\Resources\Products\Schemas;
 
-use App\Filament\Forms\Components\ShopImageUpload;
+use App\Filament\Forms\Components\ShopImageSourceFields;
 use App\Filament\Support\ShopOptions;
 use App\Models\Catalog;
 use App\Models\Category;
@@ -20,7 +20,6 @@ use Filament\Schemas\Components\Section;
 use Filament\Schemas\Components\Tabs;
 use Filament\Schemas\Components\Tabs\Tab;
 use Filament\Schemas\Components\Utilities\Get;
-use Filament\Schemas\Components\Utilities\Set;
 use Filament\Schemas\Schema;
 use Filament\Support\Icons\Heroicon;
 
@@ -279,40 +278,7 @@ class ProductForm
      */
     protected static function imageFields(): array
     {
-        return [
-            ShopImageUpload::make('image_upload')
-                ->label('Завантажити на BunnyCDN')
-                ->dehydrated(false)
-                ->afterStateUpdated(function (mixed $state, Set $set): void {
-                    $value = self::normalizeUploadedImageState($state);
-                    if ($value !== null && $value !== '') {
-                        $set('image_path', $value);
-                    }
-                })
-                ->helperText('Новий файл зберігається на CDN; URL автоматично потрапить у поле нижче.')
-                ->columnSpanFull(),
-
-            TextInput::make('image_path')
-                ->label('Посилання на зображення')
-                ->placeholder('https://example.com/photo.jpg')
-                ->helperText('Можна вставити зовнішнє посилання (імпорт з інших джерел) або CDN/локальний шлях. Зовнішні http(s) URL вітрина показує як є.')
-                ->columnSpanFull(),
-        ];
-    }
-
-    protected static function normalizeUploadedImageState(mixed $state): ?string
-    {
-        if (is_array($state)) {
-            $state = $state[0] ?? null;
-        }
-
-        if (! is_string($state)) {
-            return null;
-        }
-
-        $state = trim($state);
-
-        return $state !== '' ? $state : null;
+        return ShopImageSourceFields::make('image_path', 'Головне зображення');
     }
 
     /**
