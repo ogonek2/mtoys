@@ -65,8 +65,9 @@ class ProductFeedService
         $guard = 0;
         while ($guard < 5000) {
             $guard++;
-            $state = self::processNextPages(app()->runningInConsole() ? 10 : 2);
-            if (($state['status'] ?? '') !== 'running') {
+            $state = self::processNextPages(app()->runningInConsole() ? 10 : 1);
+            $status = (string) ($state['status'] ?? '');
+            if (in_array($status, ['done', 'failed', 'idle'], true)) {
                 break;
             }
         }
@@ -74,6 +75,9 @@ class ProductFeedService
         $state = self::buildStatus();
         if (($state['status'] ?? '') === 'failed') {
             throw new RuntimeException((string) ($state['error'] ?? 'Ошибка генерации фидов'));
+        }
+        if (($state['status'] ?? '') !== 'done') {
+            throw new RuntimeException('Генерация фидов не завершилась (status='.($state['status'] ?? 'null').')');
         }
 
         return self::meta();
@@ -125,7 +129,6 @@ class ProductFeedService
                 'no_url' => 0,
                 'duplicate_id' => 0,
             ],
-            'seen_ids' => [],
             'error' => null,
             'started_at' => now()->toIso8601String(),
             'percent' => 0,
@@ -142,7 +145,7 @@ class ProductFeedService
     }
 
     /**
-     * Обработать N следующих страниц каталога.
+     * Один тик: либо страница товаров, либо финализация XML/CSV.
      *
      * @return array<string, mixed>
      */
@@ -151,11 +154,37 @@ class ProductFeedService
         $pages = max(1, min(20, $pages));
         $state = self::buildStatus();
 
-        if ($state === null || ($state['status'] ?? '') !== 'running') {
-            return $state ?? ['status' => 'idle', 'percent' => 0];
+        if ($state === null) {
+            return ['status' => 'idle', 'percent' => 0];
         }
 
-        @set_time_limit(120);
+        $status = (string) ($state['status'] ?? '');
+
+        // Финализация — отдельный тик, иначе Livewire убивает длинный запрос на 97%.
+        if (in_array($status, ['pending_finalize', 'finalizing'], true)) {
+            @set_time_limit(180);
+            @ini_set('memory_limit', '512M');
+
+            try {
+                return self::finalizeBuild($state);
+            } catch (Throwable $e) {
+                Log::channel('single')->error('product-feeds: finalize failed', [
+                    'message' => $e->getMessage(),
+                    'file' => $e->getFile().':'.$e->getLine(),
+                ]);
+                $state['status'] = 'failed';
+                $state['error'] = $e->getMessage() !== '' ? $e->getMessage() : $e::class;
+                self::saveBuildState($state);
+
+                return $state;
+            }
+        }
+
+        if ($status !== 'running') {
+            return $state;
+        }
+
+        @set_time_limit(90);
 
         try {
             for ($i = 0; $i < $pages; $i++) {
@@ -201,18 +230,10 @@ class ProductFeedService
         }, 5);
 
         if ($products->isEmpty()) {
-            if ((int) ($state['total'] ?? 0) <= 0) {
-                $state['total'] = (int) ($state['processed'] ?? 0);
-            }
-
-            return self::finalizeBuild($state);
+            return self::markPendingFinalize($state);
         }
 
         $lines = [];
-        $seenIds = $state['seen_ids'] ?? [];
-        if (! is_array($seenIds)) {
-            $seenIds = [];
-        }
 
         foreach ($products as $product) {
             $state['after_id'] = (int) $product->id;
@@ -229,38 +250,32 @@ class ProductFeedService
                 continue;
             }
 
-            if (isset($seenIds[$row['id']])) {
-                $state['excluded'] = (int) ($state['excluded'] ?? 0) + 1;
-                $state['reasons']['duplicate_id'] = (int) ($state['reasons']['duplicate_id'] ?? 0) + 1;
-
-                continue;
-            }
-
-            $seenIds[$row['id']] = 1;
             $state['included'] = (int) ($state['included'] ?? 0) + 1;
             $lines[] = json_encode($row, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         }
 
-        if (count($seenIds) > 5000) {
-            $seenIds = array_slice($seenIds, -2000, preserve_keys: true);
-        }
-        $state['seen_ids'] = $seenIds;
         $state['page'] = (int) ($state['page'] ?? 0) + 1;
         $state['pages_total'] = max(
             (int) ($state['pages_total'] ?? 1),
-            (int) $state['page'] + 1,
+            (int) $state['page'],
         );
 
         $total = (int) ($state['total'] ?? 0);
         if ($total > 0) {
-            $state['percent'] = min(99, (int) floor(((int) $state['processed'] / $total) * 100));
+            // До 96% на обходе каталога; 97–99 — финализация отдельным тиком.
+            $state['percent'] = min(96, (int) floor(((int) $state['processed'] / $total) * 96));
         } else {
-            $state['percent'] = min(95, (int) $state['page'] * 4);
+            $state['percent'] = min(96, (int) $state['page'] * 4);
         }
 
         if ($lines !== []) {
             $path = Storage::disk('public')->path($state['build_dir'].'/items.jsonl');
             file_put_contents($path, implode("\n", $lines)."\n", FILE_APPEND | LOCK_EX);
+        }
+
+        // Последняя (неполная) страница — на следующем тике только XML/CSV.
+        if ($products->count() < self::PAGE_SIZE) {
+            return self::markPendingFinalize($state);
         }
 
         self::saveBuildState($state);
@@ -272,46 +287,74 @@ class ProductFeedService
      * @param  array<string, mixed>  $state
      * @return array<string, mixed>
      */
+    protected static function markPendingFinalize(array $state): array
+    {
+        if ((int) ($state['total'] ?? 0) <= 0) {
+            $state['total'] = (int) ($state['processed'] ?? 0);
+        }
+
+        $state['status'] = 'pending_finalize';
+        $state['percent'] = 97;
+        $state['pages_total'] = max((int) ($state['pages_total'] ?? 1), (int) ($state['page'] ?? 1));
+        self::saveBuildState($state);
+
+        Log::channel('single')->info('product-feeds: pending finalize', [
+            'processed' => $state['processed'] ?? 0,
+            'included' => $state['included'] ?? 0,
+        ]);
+
+        return $state;
+    }
+
+    /**
+     * @param  array<string, mixed>  $state
+     * @return array<string, mixed>
+     */
     protected static function finalizeBuild(array $state): array
     {
         $state['status'] = 'finalizing';
-        $state['percent'] = 99;
+        $state['percent'] = 98;
         self::saveBuildState($state);
 
-        $items = self::readBuildItems((string) $state['build_dir']);
+        $buildDir = (string) ($state['build_dir'] ?? '');
         $storeName = (string) (ShopSettings::get('store_name') ?: 'Mtoys');
         $siteUrl = self::siteUrl();
 
         Storage::disk('public')->makeDirectory(self::DIR);
 
-        $googleXml = self::buildGoogleXml($items, $storeName, $siteUrl);
-        $facebookCsv = self::buildFacebookCsv($items);
-
-        self::putAtomically(self::DIR.'/'.self::GOOGLE_FILE, $googleXml);
-        self::putAtomically(self::DIR.'/'.self::FACEBOOK_FILE, $facebookCsv);
+        // Потоковая сборка — без загрузки всех товаров в память.
+        $googlePath = self::DIR.'/'.self::GOOGLE_FILE;
+        $facebookPath = self::DIR.'/'.self::FACEBOOK_FILE;
+        $count = self::streamWriteFeeds($buildDir, $googlePath, $facebookPath, $storeName, $siteUrl);
 
         Cache::forget(self::DIRTY_CACHE_KEY);
+
+        $googleBytes = Storage::disk('public')->exists($googlePath)
+            ? (int) Storage::disk('public')->size($googlePath)
+            : 0;
+        $facebookBytes = Storage::disk('public')->exists($facebookPath)
+            ? (int) Storage::disk('public')->size($facebookPath)
+            : 0;
 
         $meta = [
             'google' => self::publicUrl('google'),
             'facebook' => self::publicUrl('facebook'),
-            'count' => count($items),
-            'catalog_total' => (int) ($state['total'] ?? count($items)),
+            'count' => $count,
+            'catalog_total' => (int) ($state['total'] ?? $count),
             'excluded' => (int) ($state['excluded'] ?? 0),
             'excluded_reasons' => $state['reasons'] ?? [],
             'generated_at' => now()->toIso8601String(),
-            'google_bytes' => strlen($googleXml),
-            'facebook_bytes' => strlen($facebookCsv),
+            'google_bytes' => $googleBytes,
+            'facebook_bytes' => $facebookBytes,
         ];
 
         Cache::forever(self::META_CACHE_KEY, $meta);
 
-        self::cleanupBuildDir((string) ($state['build_dir'] ?? ''));
+        self::cleanupBuildDir($buildDir);
 
         $state['status'] = 'done';
         $state['percent'] = 100;
-        $state['included'] = count($items);
-        $state['seen_ids'] = [];
+        $state['included'] = $count;
         $state['finished_at'] = now()->toIso8601String();
         self::saveBuildState($state);
 
@@ -320,42 +363,179 @@ class ProductFeedService
             'total' => $meta['catalog_total'],
         ]);
 
-        // Коротко живёт для UI, потом можно очистить.
         Cache::put(self::BUILD_CACHE_KEY, $state, now()->addMinutes(30));
 
         return $state;
     }
 
     /**
-     * @return list<array<string, mixed>>
+     * Читает JSONL и пишет Google XML + Facebook CSV на диск.
      */
-    protected static function readBuildItems(string $buildDir): array
+    protected static function streamWriteFeeds(
+        string $buildDir,
+        string $googleRelative,
+        string $facebookRelative,
+        string $storeName,
+        string $siteUrl,
+    ): int {
+        $jsonl = Storage::disk('public')->path($buildDir.'/items.jsonl');
+        $googleTmp = Storage::disk('public')->path($googleRelative.'.tmp');
+        $facebookTmp = Storage::disk('public')->path($facebookRelative.'.tmp');
+
+        @unlink($googleTmp);
+        @unlink($facebookTmp);
+
+        $g = fopen($googleTmp, 'wb');
+        $f = fopen($facebookTmp, 'wb');
+        if ($g === false || $f === false) {
+            throw new RuntimeException('Не удалось открыть временные файлы фидов');
+        }
+
+        fwrite($g, '<?xml version="1.0" encoding="UTF-8"?>'."\n");
+        fwrite($g, '<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">'."\n");
+        fwrite($g, "  <channel>\n");
+        fwrite($g, '    <title>'.self::xmlEscape($storeName)."</title>\n");
+        fwrite($g, '    <link>'.self::xmlEscape($siteUrl)."</link>\n");
+        fwrite($g, '    <description>'.self::xmlEscape($storeName.' — товарный фид Google Merchant')."</description>\n");
+
+        fwrite($f, "\xEF\xBB\xBF");
+        fputcsv($f, [
+            'id', 'title', 'description', 'availability', 'condition', 'price', 'link',
+            'image_link', 'brand', 'sale_price', 'additional_image_link', 'product_type', 'mpn', 'status',
+        ]);
+
+        $count = 0;
+        if (is_file($jsonl)) {
+            $in = fopen($jsonl, 'rb');
+            if ($in !== false) {
+                while (($line = fgets($in)) !== false) {
+                    $line = trim($line);
+                    if ($line === '') {
+                        continue;
+                    }
+                    $item = json_decode($line, true);
+                    if (! is_array($item) || empty($item['id'])) {
+                        continue;
+                    }
+                    $count++;
+                    self::writeGoogleItemStream($g, $item);
+                    self::writeFacebookRowStream($f, $item);
+                }
+                fclose($in);
+            }
+        }
+
+        fwrite($g, "  </channel>\n</rss>\n");
+        fclose($g);
+        fclose($f);
+
+        self::replaceBuiltFile($googleRelative, $googleTmp);
+        self::replaceBuiltFile($facebookRelative, $facebookTmp);
+
+        return $count;
+    }
+
+    protected static function replaceBuiltFile(string $relative, string $absoluteTmp): void
     {
-        $path = Storage::disk('public')->path($buildDir.'/items.jsonl');
-        if (! is_file($path)) {
-            return [];
+        $final = Storage::disk('public')->path($relative);
+        $dir = dirname($final);
+        if (! is_dir($dir)) {
+            @mkdir($dir, 0775, true);
         }
-
-        $items = [];
-        $handle = fopen($path, 'rb');
-        if ($handle === false) {
-            return [];
+        if (is_file($final)) {
+            @unlink($final);
         }
-
-        while (($line = fgets($handle)) !== false) {
-            $line = trim($line);
-            if ($line === '') {
-                continue;
+        if (! @rename($absoluteTmp, $final)) {
+            if (! @copy($absoluteTmp, $final)) {
+                throw new RuntimeException('Не удалось сохранить фид: '.$relative);
             }
-            $row = json_decode($line, true);
-            if (is_array($row) && isset($row['id'])) {
-                $items[] = $row;
-            }
+            @unlink($absoluteTmp);
+        }
+    }
+
+    /**
+     * @param  resource  $handle
+     * @param  array<string, mixed>  $item
+     */
+    protected static function writeGoogleItemStream($handle, array $item): void
+    {
+        $extra = $item['additional_image_links'] ?? [];
+        if (! is_array($extra)) {
+            $extra = [];
         }
 
-        fclose($handle);
+        fwrite($handle, "    <item>\n");
+        self::writeGStream($handle, 'id', (string) $item['id']);
+        self::writeGStream($handle, 'title', (string) ($item['title'] ?? ''));
+        self::writeGStream($handle, 'description', (string) ($item['description'] ?? ''));
+        self::writeGStream($handle, 'link', (string) ($item['link'] ?? ''));
+        self::writeGStream($handle, 'image_link', (string) ($item['image_link'] ?? ''));
+        foreach ($extra as $url) {
+            self::writeGStream($handle, 'additional_image_link', (string) $url);
+        }
+        self::writeGStream($handle, 'availability', (string) ($item['availability'] ?? 'out_of_stock'));
+        self::writeGStream($handle, 'condition', (string) ($item['condition'] ?? 'new'));
+        self::writeGStream($handle, 'price', (string) ($item['price'] ?? ''));
+        if (! empty($item['sale_price'])) {
+            self::writeGStream($handle, 'sale_price', (string) $item['sale_price']);
+        }
+        self::writeGStream($handle, 'brand', (string) ($item['brand'] ?? 'Mtoys'));
+        if (! empty($item['mpn'])) {
+            self::writeGStream($handle, 'mpn', (string) $item['mpn']);
+        }
+        self::writeGStream($handle, 'identifier_exists', ! empty($item['identifier_exists']) ? 'yes' : 'no');
+        if (! empty($item['product_type'])) {
+            self::writeGStream($handle, 'product_type', (string) $item['product_type']);
+        }
+        fwrite($handle, "      <g:shipping>\n");
+        self::writeGStream($handle, 'country', 'UA', 8);
+        self::writeGStream($handle, 'service', 'Standard', 8);
+        self::writeGStream($handle, 'price', '0.00 UAH', 8);
+        fwrite($handle, "      </g:shipping>\n");
+        fwrite($handle, "    </item>\n");
+    }
 
-        return $items;
+    /**
+     * @param  resource  $handle
+     */
+    protected static function writeGStream($handle, string $name, string $value, int $indent = 6): void
+    {
+        $pad = str_repeat(' ', $indent);
+        fwrite($handle, $pad.'<g:'.$name.'>'.self::xmlEscape($value).'</g:'.$name.">\n");
+    }
+
+    protected static function xmlEscape(string $value): string
+    {
+        return htmlspecialchars($value, ENT_XML1 | ENT_QUOTES, 'UTF-8');
+    }
+
+    /**
+     * @param  resource  $handle
+     * @param  array<string, mixed>  $item
+     */
+    protected static function writeFacebookRowStream($handle, array $item): void
+    {
+        $extra = $item['additional_image_links'] ?? [];
+        if (! is_array($extra)) {
+            $extra = [];
+        }
+
+        fputcsv($handle, [
+            $item['id'] ?? '',
+            $item['title'] ?? '',
+            $item['description'] ?? '',
+            $item['availability_facebook'] ?? 'out of stock',
+            $item['condition'] ?? 'new',
+            $item['price'] ?? '',
+            $item['link'] ?? '',
+            $item['image_link'] ?? '',
+            $item['brand'] ?? '',
+            $item['sale_price'] ?? '',
+            implode(',', $extra),
+            $item['product_type'] ?? '',
+            $item['mpn'] ?? '',
+            'active',
+        ]);
     }
 
     protected static function cleanupBuildDir(string $buildDir): void

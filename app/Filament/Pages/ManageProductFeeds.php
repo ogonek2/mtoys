@@ -264,7 +264,8 @@ class ManageProductFeeds extends Page
         }
 
         try {
-            $state = ProductFeedService::processNextPages(2);
+            // По 1 странице за тик; финализация XML — отдельным тиком после pending_finalize.
+            $state = ProductFeedService::processNextPages(1);
         } catch (Throwable $e) {
             $this->isBuilding = false;
             Log::channel('single')->error('product-feeds: tick failed', [
@@ -314,7 +315,12 @@ class ManageProductFeeds extends Page
     {
         $this->js(<<<'JS'
             clearInterval(window.__mtoysFeedBuildTimer);
+            window.__mtoysFeedBuildBusy = false;
             window.__mtoysFeedBuildTimer = setInterval(async () => {
+                if (window.__mtoysFeedBuildBusy) {
+                    return;
+                }
+                window.__mtoysFeedBuildBusy = true;
                 try {
                     const done = await $wire.tickBuild();
                     if (done) {
@@ -322,8 +328,10 @@ class ManageProductFeeds extends Page
                     }
                 } catch (e) {
                     console.error(e);
+                } finally {
+                    window.__mtoysFeedBuildBusy = false;
                 }
-            }, 900);
+            }, 1000);
         JS);
     }
 
@@ -335,7 +343,7 @@ class ManageProductFeeds extends Page
         }
 
         $status = (string) ($state['status'] ?? '');
-        if (in_array($status, ['running', 'finalizing'], true)) {
+        if (in_array($status, ['running', 'pending_finalize', 'finalizing'], true)) {
             $this->isBuilding = true;
             $this->applyBuildState($state);
         }
@@ -355,7 +363,8 @@ class ManageProductFeeds extends Page
 
         $status = (string) ($state['status'] ?? '');
         $this->buildLabel = match ($status) {
-            'finalizing' => 'Сборка XML/CSV…',
+            'pending_finalize' => 'Каталог собран — следующий шаг: запись XML/CSV…',
+            'finalizing' => 'Запись Google XML и Facebook CSV…',
             'done' => 'Готово',
             'failed' => 'Ошибка',
             default => sprintf(
