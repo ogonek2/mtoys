@@ -8,14 +8,18 @@ use Throwable;
 
 class GenerateProductFeedsCommand extends Command
 {
-    protected $signature = 'feeds:generate {--force : Пересобрать даже если нет изменений}';
+    protected $signature = 'feeds:generate {--force : Принудительно}';
 
-    protected $description = 'Сгенерировать Google Merchant и Facebook Catalog фиды из БД';
+    protected $description = 'Собрать Google/Facebook фиды из таблицы products';
 
     public function handle(): int
     {
-        if (! $this->option('force') && ! cache()->get(ProductFeedService::DIRTY_CACHE_KEY) && ProductFeedService::exists('google')) {
-            $this->info('Фиды актуальны. Используйте --force для принудительной генерации.');
+        if (
+            ! $this->option('force')
+            && ! cache()->get(\App\Services\Feeds\FeedBuilder::DIRTY_KEY)
+            && ProductFeedService::exists('google')
+        ) {
+            $this->info('Фиды актуальны. --force для пересборки.');
 
             return self::SUCCESS;
         }
@@ -23,14 +27,14 @@ class GenerateProductFeedsCommand extends Command
         try {
             $meta = ProductFeedService::generate();
         } catch (Throwable $e) {
-            $this->error('Ошибка: '.$e->getMessage());
+            $this->error($e->getMessage());
 
             return self::FAILURE;
         }
 
-        $this->info("Готово: {$meta['count']} из {$meta['catalog_total']} товаров.");
-        $this->line('Google: '.$meta['google']);
-        $this->line('Facebook: '.$meta['facebook']);
+        $this->info("OK: {$meta['count']} / {$meta['catalog_total']}");
+        $this->line($meta['google']);
+        $this->line($meta['facebook']);
 
         return self::SUCCESS;
     }
