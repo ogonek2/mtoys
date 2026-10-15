@@ -104,30 +104,53 @@ class ProductFeedService
     public static function meta(): array
     {
         $meta = Cache::get(self::META_CACHE_KEY);
-        $defaults = [
-            'google' => self::publicUrl('google'),
-            'facebook' => self::publicUrl('facebook'),
-            'count' => 0,
-            'catalog_total' => 0,
-            'excluded' => 0,
-            'excluded_reasons' => [],
-            'generated_at' => null,
-            'dirty' => (bool) Cache::get(self::DIRTY_CACHE_KEY),
-            'google_exists' => self::exists('google'),
-            'facebook_exists' => self::exists('facebook'),
-        ];
-
         if (! is_array($meta)) {
-            return $defaults;
+            $meta = [];
         }
 
-        return array_merge($defaults, $meta, [
+        $googleExists = self::exists('google');
+        $facebookExists = self::exists('facebook');
+
+        // Сверяем count с реальным XML — cache мог остаться от сорванной генерации.
+        if ($googleExists) {
+            $xml = (string) Storage::disk('public')->get(self::relativePath('google'));
+            $fileCount = substr_count($xml, '<item>');
+            if ($fileCount > 0) {
+                $meta['count'] = $fileCount;
+                $meta['google_bytes'] = strlen($xml);
+            }
+        }
+
+        if ($facebookExists) {
+            $csv = (string) Storage::disk('public')->get(self::relativePath('facebook'));
+            $meta['facebook_bytes'] = strlen($csv);
+        }
+
+        if (empty($meta['catalog_total'])) {
+            try {
+                Database::reconnect();
+                $meta['catalog_total'] = (int) Database::retry(
+                    static fn (): int => Product::query()->count()
+                );
+            } catch (Throwable) {
+                $meta['catalog_total'] = (int) ($meta['count'] ?? 0);
+            }
+        }
+
+        return [
             'google' => self::publicUrl('google'),
             'facebook' => self::publicUrl('facebook'),
+            'count' => (int) ($meta['count'] ?? 0),
+            'catalog_total' => (int) ($meta['catalog_total'] ?? 0),
+            'excluded' => (int) ($meta['excluded'] ?? max(0, (int) ($meta['catalog_total'] ?? 0) - (int) ($meta['count'] ?? 0))),
+            'excluded_reasons' => is_array($meta['excluded_reasons'] ?? null) ? $meta['excluded_reasons'] : [],
+            'generated_at' => $meta['generated_at'] ?? null,
+            'google_bytes' => (int) ($meta['google_bytes'] ?? 0),
+            'facebook_bytes' => (int) ($meta['facebook_bytes'] ?? 0),
             'dirty' => (bool) Cache::get(self::DIRTY_CACHE_KEY),
-            'google_exists' => self::exists('google'),
-            'facebook_exists' => self::exists('facebook'),
-        ]);
+            'google_exists' => $googleExists,
+            'facebook_exists' => $facebookExists,
+        ];
     }
 
     public static function exists(string $type): bool
