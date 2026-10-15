@@ -19,9 +19,14 @@ class ManageProductFeeds extends Page
 
     protected static ?string $navigationLabel = 'Фиды товаров';
 
-    protected static ?string $title = 'Google и Facebook фиды';
+    protected static ?string $title = 'Товарные фиды';
 
     protected static ?int $navigationSort = 95;
+
+    public function getSubheading(): ?string
+    {
+        return 'Google Merchant Center и Facebook / Meta Catalog';
+    }
 
     protected string $view = 'filament.pages.manage-product-feeds';
 
@@ -36,13 +41,24 @@ class ManageProductFeeds extends Page
     protected function getHeaderActions(): array
     {
         return [
+            Action::make('openGoogle')
+                ->label('Google XML')
+                ->icon(Heroicon::OutlinedArrowTopRightOnSquare)
+                ->color('gray')
+                ->url(fn (): string => ProductFeedService::publicUrl('google'), shouldOpenInNewTab: true),
+            Action::make('openFacebook')
+                ->label('Facebook CSV')
+                ->icon(Heroicon::OutlinedArrowTopRightOnSquare)
+                ->color('gray')
+                ->url(fn (): string => ProductFeedService::publicUrl('facebook'), shouldOpenInNewTab: true),
             Action::make('generate')
                 ->label('Сгенерировать сейчас')
                 ->icon(Heroicon::OutlinedArrowPath)
                 ->color('primary')
                 ->requiresConfirmation()
                 ->modalHeading('Пересобрать фиды?')
-                ->modalDescription('Будут заново собраны Google Merchant XML и Facebook Catalog CSV по текущим товарам.')
+                ->modalDescription('Будут заново собраны Google Merchant XML и Facebook Catalog CSV. Это может занять до минуты.')
+                ->successNotification(null)
                 ->action(function (): void {
                     try {
                         $meta = ProductFeedService::generate();
@@ -58,7 +74,7 @@ class ManageProductFeeds extends Page
 
                     Notification::make()
                         ->title('Фиды обновлены')
-                        ->body("Товаров в фиде: {$meta['count']}")
+                        ->body("В фиде: {$meta['count']} из {$meta['catalog_total']} товаров")
                         ->success()
                         ->send();
                 }),
