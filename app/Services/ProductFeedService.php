@@ -7,8 +7,10 @@ use App\Models\Product;
 use App\Models\productImage;
 use App\Support\Database;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use RuntimeException;
 use Throwable;
 
 class ProductFeedService
@@ -56,15 +58,31 @@ class ProductFeedService
      */
     public static function generate(): array
     {
-        $lock = Cache::lock('product-feeds.generate', 300);
+        @set_time_limit(0);
+        @ini_set('memory_limit', '512M');
+        @ini_set('max_execution_time', '0');
 
-        return $lock->block(15, function (): array {
-            @set_time_limit(300);
-            ini_set('memory_limit', '512M');
+        // Старый Cache::lock мог «залипнуть» после таймаута PHP в админке.
+        try {
+            Cache::lock('product-feeds.generate')->forceRelease();
+        } catch (Throwable) {
+            // ignore
+        }
+
+        $lockHandle = self::acquireFileLock();
+
+        try {
+            Log::channel('single')->info('product-feeds: generate started');
 
             Storage::disk('public')->makeDirectory(self::DIR);
 
-            Database::reconnect();
+            try {
+                Database::reconnect();
+            } catch (Throwable $e) {
+                Log::channel('single')->warning('product-feeds: reconnect failed', [
+                    'message' => $e->getMessage(),
+                ]);
+            }
 
             $collected = self::collectItems();
             $items = $collected['items'];
@@ -74,7 +92,6 @@ class ProductFeedService
             $googleXml = self::buildGoogleXml($items, $storeName, $siteUrl);
             $facebookCsv = self::buildFacebookCsv($items);
 
-            // Атомарная запись: сначала tmp, потом rename.
             self::putAtomically(self::DIR.'/'.self::GOOGLE_FILE, $googleXml);
             self::putAtomically(self::DIR.'/'.self::FACEBOOK_FILE, $facebookCsv);
 
@@ -94,8 +111,66 @@ class ProductFeedService
 
             Cache::forever(self::META_CACHE_KEY, $meta);
 
+            Log::channel('single')->info('product-feeds: generate finished', [
+                'count' => $meta['count'],
+                'catalog_total' => $meta['catalog_total'],
+            ]);
+
             return $meta;
-        });
+        } catch (Throwable $e) {
+            Log::channel('single')->error('product-feeds: generate failed', [
+                'exception' => $e::class,
+                'message' => $e->getMessage(),
+                'file' => $e->getFile().':'.$e->getLine(),
+            ]);
+
+            throw $e;
+        } finally {
+            self::releaseFileLock($lockHandle);
+        }
+    }
+
+    /**
+     * @return resource
+     */
+    protected static function acquireFileLock()
+    {
+        $dir = storage_path('app');
+        if (! is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+
+        $path = $dir.DIRECTORY_SEPARATOR.'product-feeds.generate.lock';
+        $handle = @fopen($path, 'c+');
+
+        if ($handle === false) {
+            throw new RuntimeException('Не удалось создать файл блокировки фидов: '.$path);
+        }
+
+        // Неблокирующий захват: если уже идёт генерация — сразу понятная ошибка.
+        if (! flock($handle, LOCK_EX | LOCK_NB)) {
+            fclose($handle);
+            throw new RuntimeException('Генерация фидов уже выполняется. Подождите 1–2 минуты и повторите.');
+        }
+
+        ftruncate($handle, 0);
+        fwrite($handle, (string) getmypid());
+        fflush($handle);
+
+        return $handle;
+    }
+
+    /**
+     * @param  resource|null  $handle
+     */
+    protected static function releaseFileLock(mixed $handle): void
+    {
+        if (! is_resource($handle)) {
+            return;
+        }
+
+        flock($handle, LOCK_UN);
+        fclose($handle);
     }
 
     /**
@@ -228,20 +303,25 @@ class ProductFeedService
             ],
         ];
 
-        $page = 0;
+        $lastId = 0;
+        $guard = 0;
 
         while (true) {
-            $page++;
-            Database::reconnect();
+            $guard++;
+            if ($guard > 5000) {
+                break;
+            }
 
-            $products = Database::retry(function () use ($page) {
+            $products = Database::retry(function () use ($lastId) {
                 return Product::query()
                     ->with([
-                        'categories.parentCategory.parentCategory.parentCategory',
-                        'images',
+                        'categories:id,name,url,parent_id',
+                        'categories.parentCategory:id,name,parent_id',
+                        'images:id,product_id,src',
                     ])
+                    ->where('id', '>', $lastId)
                     ->orderBy('id')
-                    ->forPage($page, 100)
+                    ->limit(150)
                     ->get();
             });
 
@@ -250,12 +330,12 @@ class ProductFeedService
             }
 
             foreach ($products as $product) {
+                $lastId = (int) $product->id;
                 $stats['total']++;
 
                 $row = self::mapProduct($product);
                 if ($row === null) {
                     $stats['excluded']++;
-                    // причина уже учтена в mapProduct через lastSkipReason
                     $reason = self::$lastSkipReason ?? 'no_image';
                     if (isset($stats['reasons'][$reason])) {
                         $stats['reasons'][$reason]++;
@@ -273,11 +353,6 @@ class ProductFeedService
 
                 $seenIds[$row['id']] = true;
                 $items[] = $row;
-            }
-
-            // Защита от бесконечного цикла на странном ProxySQL.
-            if ($page > 5000) {
-                break;
             }
         }
 

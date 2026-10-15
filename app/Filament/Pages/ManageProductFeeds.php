@@ -17,7 +17,9 @@ use Filament\Schemas\Components\Text;
 use Filament\Schemas\Schema;
 use Filament\Support\Enums\TextSize;
 use Filament\Support\Icons\Heroicon;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Js;
+use Illuminate\Support\Str;
 use Throwable;
 use UnitEnum;
 
@@ -176,13 +178,28 @@ class ManageProductFeeds extends Page
                 ->modalDescription('Сбор Google XML и Facebook CSV по всему каталогу. Обычно до минуты.')
                 ->successNotification(null)
                 ->action(function (): void {
+                    @set_time_limit(0);
+                    @ini_set('max_execution_time', '0');
+
                     try {
                         $meta = ProductFeedService::generate();
                     } catch (Throwable $e) {
+                        Log::channel('single')->error('product-feeds: filament action failed', [
+                            'exception' => $e::class,
+                            'message' => $e->getMessage(),
+                            'file' => $e->getFile().':'.$e->getLine(),
+                        ]);
+
+                        $message = trim($e->getMessage());
+                        if ($message === '') {
+                            $message = $e::class;
+                        }
+
                         Notification::make()
                             ->title('Не удалось сгенерировать фиды')
-                            ->body($e->getMessage())
+                            ->body(Str::limit($message, 400))
                             ->danger()
+                            ->persistent()
                             ->send();
 
                         return;
