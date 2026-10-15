@@ -43,9 +43,30 @@ class ManageProductFeeds extends Page
      */
     public ?array $data = [];
 
+    public bool $isBuilding = false;
+
+    public int $buildPercent = 0;
+
+    public int $buildPage = 0;
+
+    public int $buildPagesTotal = 0;
+
+    public int $buildProcessed = 0;
+
+    public int $buildTotal = 0;
+
+    public int $buildIncluded = 0;
+
+    public string $buildLabel = '';
+
     public function mount(): void
     {
         $this->fillFromMeta();
+        $this->syncBuildFromCache();
+
+        if ($this->isBuilding) {
+            $this->startBuildPolling();
+        }
     }
 
     public function getSubheading(): ?string
@@ -62,11 +83,19 @@ class ManageProductFeeds extends Page
     {
         return $schema
             ->components([
+                Callout::make(fn (): string => 'Сборка фидов: '.$this->buildPercent.'%')
+                    ->description(fn (): string => $this->buildLabel !== ''
+                        ? $this->buildLabel
+                        : 'Обработка каталога по страницам…')
+                    ->info()
+                    ->icon(Heroicon::OutlinedArrowPath)
+                    ->visible(fn (): bool => $this->isBuilding),
+
                 Callout::make('Фиды устарели')
-                    ->description('Каталог изменился после последней генерации. Нажмите «Сгенерировать сейчас».')
+                    ->description('Каталог изменился после последней генерации. Запустите постраничную сборку.')
                     ->warning()
                     ->icon(Heroicon::OutlinedExclamationTriangle)
-                    ->visible(fn (): bool => (bool) ($this->data['dirty'] ?? false)),
+                    ->visible(fn (): bool => ! $this->isBuilding && (bool) ($this->data['dirty'] ?? false)),
 
                 Section::make('Статус')
                     ->description('Количество товаров сверяется с XML на диске')
@@ -137,7 +166,7 @@ class ManageProductFeeds extends Page
                 Section::make('Правила фида')
                     ->collapsed()
                     ->schema([
-                        Text::make('В фид: название, цена > 0, фото (главное или галерея). ID товара стабильный, артикул → mpn. Цены UAH, картинки HTTPS/CDN. Автообновление после сохранения, импорта и удаления.')
+                        Text::make('Сборка идёт постранично (по '.ProductFeedService::PAGE_SIZE.' товаров × 2 страницы за тик), чтобы не упираться в таймаут PHP. ID товара стабильный, артикул → mpn.')
                             ->size(TextSize::Small)
                             ->color('gray'),
                         Text::make(fn (): string => $this->filesHint())
@@ -169,51 +198,175 @@ class ManageProductFeeds extends Page
                 ->icon(Heroicon::OutlinedArrowTopRightOnSquare)
                 ->color('gray')
                 ->url(fn (): string => ProductFeedService::publicUrl('facebook'), shouldOpenInNewTab: true),
+            Action::make('cancelBuild')
+                ->label('Остановить')
+                ->icon(Heroicon::OutlinedXMark)
+                ->color('danger')
+                ->visible(fn (): bool => $this->isBuilding)
+                ->requiresConfirmation()
+                ->action(function (): void {
+                    ProductFeedService::cancelBuild();
+                    $this->isBuilding = false;
+                    $this->buildLabel = '';
+                    $this->js('clearInterval(window.__mtoysFeedBuildTimer)');
+                    Notification::make()->title('Сборка остановлена')->warning()->send();
+                }),
             Action::make('generate')
                 ->label('Сгенерировать сейчас')
                 ->icon(Heroicon::OutlinedArrowPath)
                 ->color('primary')
+                ->disabled(fn (): bool => $this->isBuilding)
                 ->requiresConfirmation()
-                ->modalHeading('Пересобрать фиды?')
-                ->modalDescription('Сбор Google XML и Facebook CSV по всему каталогу. Обычно до минуты.')
+                ->modalHeading('Постраничная сборка фидов')
+                ->modalDescription('Каталог обрабатывается порциями по '.ProductFeedService::PAGE_SIZE.' товаров. Прогресс — в блоке «Сборка фидов» на странице.')
                 ->successNotification(null)
-                ->action(function (): void {
-                    @set_time_limit(0);
-                    @ini_set('max_execution_time', '0');
-
-                    try {
-                        $meta = ProductFeedService::generate();
-                    } catch (Throwable $e) {
-                        Log::channel('single')->error('product-feeds: filament action failed', [
-                            'exception' => $e::class,
-                            'message' => $e->getMessage(),
-                            'file' => $e->getFile().':'.$e->getLine(),
-                        ]);
-
-                        $message = trim($e->getMessage());
-                        if ($message === '') {
-                            $message = $e::class;
-                        }
-
-                        Notification::make()
-                            ->title('Не удалось сгенерировать фиды')
-                            ->body(Str::limit($message, 400))
-                            ->danger()
-                            ->persistent()
-                            ->send();
-
-                        return;
-                    }
-
-                    $this->fillFromMeta($meta);
-
-                    Notification::make()
-                        ->title('Фиды обновлены')
-                        ->body("В фиде: {$meta['count']} из {$meta['catalog_total']} товаров")
-                        ->success()
-                        ->send();
-                }),
+                ->action(fn () => $this->startPaginatedBuild()),
         ];
+    }
+
+    public function startPaginatedBuild(): void
+    {
+        try {
+            $state = ProductFeedService::startBuild();
+        } catch (Throwable $e) {
+            Log::channel('single')->error('product-feeds: start failed', [
+                'message' => $e->getMessage(),
+            ]);
+            Notification::make()
+                ->title('Не удалось начать сборку')
+                ->body(Str::limit($e->getMessage() ?: $e::class, 400))
+                ->danger()
+                ->persistent()
+                ->send();
+
+            return;
+        }
+
+        $this->applyBuildState($state);
+        $this->isBuilding = true;
+
+        Notification::make()
+            ->title('Сборка запущена')
+            ->body('Каталог обрабатывается по страницам — не закрывайте вкладку.')
+            ->info()
+            ->send();
+
+        $this->startBuildPolling();
+    }
+
+    /**
+     * @return bool true = сборка завершена (остановить poll)
+     */
+    public function tickBuild(): bool
+    {
+        if (! $this->isBuilding) {
+            return true;
+        }
+
+        try {
+            $state = ProductFeedService::processNextPages(2);
+        } catch (Throwable $e) {
+            $this->isBuilding = false;
+            Log::channel('single')->error('product-feeds: tick failed', [
+                'message' => $e->getMessage(),
+            ]);
+            Notification::make()
+                ->title('Ошибка сборки фидов')
+                ->body(Str::limit($e->getMessage() ?: $e::class, 400))
+                ->danger()
+                ->persistent()
+                ->send();
+
+            return true;
+        }
+
+        $this->applyBuildState($state);
+        $status = (string) ($state['status'] ?? '');
+
+        if ($status === 'done') {
+            $this->isBuilding = false;
+            $this->fillFromMeta();
+            Notification::make()
+                ->title('Фиды обновлены')
+                ->body('В фиде: '.(int) ($state['included'] ?? 0).' из '.(int) ($state['total'] ?? 0).' товаров')
+                ->success()
+                ->send();
+
+            return true;
+        }
+
+        if ($status === 'failed') {
+            $this->isBuilding = false;
+            Notification::make()
+                ->title('Сборка прервалась')
+                ->body(Str::limit((string) ($state['error'] ?? 'Неизвестная ошибка'), 400))
+                ->danger()
+                ->persistent()
+                ->send();
+
+            return true;
+        }
+
+        return false;
+    }
+
+    protected function startBuildPolling(): void
+    {
+        $this->js(<<<'JS'
+            clearInterval(window.__mtoysFeedBuildTimer);
+            window.__mtoysFeedBuildTimer = setInterval(async () => {
+                try {
+                    const done = await $wire.tickBuild();
+                    if (done) {
+                        clearInterval(window.__mtoysFeedBuildTimer);
+                    }
+                } catch (e) {
+                    console.error(e);
+                }
+            }, 900);
+        JS);
+    }
+
+    protected function syncBuildFromCache(): void
+    {
+        $state = ProductFeedService::buildStatus();
+        if ($state === null) {
+            return;
+        }
+
+        $status = (string) ($state['status'] ?? '');
+        if (in_array($status, ['running', 'finalizing'], true)) {
+            $this->isBuilding = true;
+            $this->applyBuildState($state);
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $state
+     */
+    protected function applyBuildState(array $state): void
+    {
+        $this->buildPercent = (int) ($state['percent'] ?? 0);
+        $this->buildPage = (int) ($state['page'] ?? 0);
+        $this->buildPagesTotal = (int) ($state['pages_total'] ?? 0);
+        $this->buildProcessed = (int) ($state['processed'] ?? 0);
+        $this->buildTotal = (int) ($state['total'] ?? 0);
+        $this->buildIncluded = (int) ($state['included'] ?? 0);
+
+        $status = (string) ($state['status'] ?? '');
+        $this->buildLabel = match ($status) {
+            'finalizing' => 'Сборка XML/CSV…',
+            'done' => 'Готово',
+            'failed' => 'Ошибка',
+            default => sprintf(
+                'Страница %d из %d · обработано %d / %d · в фид %d',
+                $this->buildPage,
+                max(1, $this->buildPagesTotal),
+                $this->buildProcessed,
+                $this->buildTotal,
+                $this->buildIncluded,
+            ),
+        };
     }
 
     protected function copyUrl(string $type): void

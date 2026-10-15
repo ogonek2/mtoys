@@ -25,21 +25,18 @@ class ProductFeedService
 
     public const DIRTY_CACHE_KEY = 'product-feeds.dirty';
 
+    public const BUILD_CACHE_KEY = 'product-feeds.build';
+
+    /** Размер страницы для веб-генерации (короткий HTTP-запрос). */
+    public const PAGE_SIZE = 40;
+
     /**
-     * Пометить фиды устаревшими и пересобрать после ответа (HTTP)
-     * или позже через artisan / финализатор импорта (CLI).
+     * Пометить фиды устаревшими. Полная пересборка — кроном / вручную
+     * (постранично в админке), чтобы не ронять PHP по таймауту.
      */
     public static function schedule(): void
     {
         Cache::put(self::DIRTY_CACHE_KEY, true, now()->addHours(6));
-
-        if (app()->runningInConsole()) {
-            return;
-        }
-
-        dispatch(static function (): void {
-            self::flushDirty();
-        })->afterResponse();
     }
 
     public static function flushDirty(): bool
@@ -54,123 +51,347 @@ class ProductFeedService
     }
 
     /**
+     * Полная генерация (CLI / крон): крутит страницы до конца.
+     *
      * @return array<string, mixed>
      */
     public static function generate(): array
     {
         @set_time_limit(0);
         @ini_set('memory_limit', '512M');
-        @ini_set('max_execution_time', '0');
 
-        // Старый Cache::lock мог «залипнуть» после таймаута PHP в админке.
-        try {
-            Cache::lock('product-feeds.generate')->forceRelease();
-        } catch (Throwable) {
-            // ignore
+        self::startBuild();
+
+        $guard = 0;
+        while ($guard < 5000) {
+            $guard++;
+            $state = self::processNextPages(app()->runningInConsole() ? 10 : 2);
+            if (($state['status'] ?? '') !== 'running') {
+                break;
+            }
         }
 
-        $lockHandle = self::acquireFileLock();
+        $state = self::buildStatus();
+        if (($state['status'] ?? '') === 'failed') {
+            throw new RuntimeException((string) ($state['error'] ?? 'Ошибка генерации фидов'));
+        }
+
+        return self::meta();
+    }
+
+    /**
+     * Старт постраничной сборки (админка / CLI).
+     *
+     * @return array<string, mixed>
+     */
+    public static function startBuild(): array
+    {
+        self::cancelBuild();
+
+        $total = 0;
+        try {
+            $total = (int) Database::retry(static function (): int {
+                Database::reconnect();
+
+                return Product::query()->count();
+            }, 5);
+        } catch (Throwable $e) {
+            Log::channel('single')->warning('product-feeds: count failed, build without total', [
+                'message' => $e->getMessage(),
+            ]);
+        }
+
+        $token = Str::lower(Str::random(12));
+        $buildDir = self::DIR.'/build/'.$token;
+
+        Storage::disk('public')->makeDirectory($buildDir);
+        Storage::disk('public')->put($buildDir.'/items.jsonl', '');
+
+        $state = [
+            'status' => 'running',
+            'token' => $token,
+            'build_dir' => $buildDir,
+            'after_id' => 0,
+            'page' => 0,
+            'pages_total' => $total > 0 ? max(1, (int) ceil($total / self::PAGE_SIZE)) : 1,
+            'total' => $total,
+            'processed' => 0,
+            'included' => 0,
+            'excluded' => 0,
+            'reasons' => [
+                'no_name' => 0,
+                'no_price' => 0,
+                'no_image' => 0,
+                'no_url' => 0,
+                'duplicate_id' => 0,
+            ],
+            'seen_ids' => [],
+            'error' => null,
+            'started_at' => now()->toIso8601String(),
+            'percent' => 0,
+        ];
+
+        self::saveBuildState($state);
+        Log::channel('single')->info('product-feeds: paginated build started', [
+            'token' => $token,
+            'total' => $total,
+            'pages' => $state['pages_total'],
+        ]);
+
+        return $state;
+    }
+
+    /**
+     * Обработать N следующих страниц каталога.
+     *
+     * @return array<string, mixed>
+     */
+    public static function processNextPages(int $pages = 1): array
+    {
+        $pages = max(1, min(20, $pages));
+        $state = self::buildStatus();
+
+        if ($state === null || ($state['status'] ?? '') !== 'running') {
+            return $state ?? ['status' => 'idle', 'percent' => 0];
+        }
+
+        @set_time_limit(120);
 
         try {
-            Log::channel('single')->info('product-feeds: generate started');
-
-            Storage::disk('public')->makeDirectory(self::DIR);
-
-            try {
-                Database::reconnect();
-            } catch (Throwable $e) {
-                Log::channel('single')->warning('product-feeds: reconnect failed', [
-                    'message' => $e->getMessage(),
-                ]);
+            for ($i = 0; $i < $pages; $i++) {
+                $state = self::processOnePage($state);
+                if (($state['status'] ?? '') !== 'running') {
+                    break;
+                }
             }
-
-            $collected = self::collectItems();
-            $items = $collected['items'];
-            $storeName = (string) (ShopSettings::get('store_name') ?: 'Mtoys');
-            $siteUrl = self::siteUrl();
-
-            $googleXml = self::buildGoogleXml($items, $storeName, $siteUrl);
-            $facebookCsv = self::buildFacebookCsv($items);
-
-            self::putAtomically(self::DIR.'/'.self::GOOGLE_FILE, $googleXml);
-            self::putAtomically(self::DIR.'/'.self::FACEBOOK_FILE, $facebookCsv);
-
-            Cache::forget(self::DIRTY_CACHE_KEY);
-
-            $meta = [
-                'google' => self::publicUrl('google'),
-                'facebook' => self::publicUrl('facebook'),
-                'count' => count($items),
-                'catalog_total' => $collected['stats']['total'],
-                'excluded' => $collected['stats']['excluded'],
-                'excluded_reasons' => $collected['stats']['reasons'],
-                'generated_at' => now()->toIso8601String(),
-                'google_bytes' => strlen($googleXml),
-                'facebook_bytes' => strlen($facebookCsv),
-            ];
-
-            Cache::forever(self::META_CACHE_KEY, $meta);
-
-            Log::channel('single')->info('product-feeds: generate finished', [
-                'count' => $meta['count'],
-                'catalog_total' => $meta['catalog_total'],
-            ]);
-
-            return $meta;
         } catch (Throwable $e) {
-            Log::channel('single')->error('product-feeds: generate failed', [
-                'exception' => $e::class,
+            Log::channel('single')->error('product-feeds: page failed', [
                 'message' => $e->getMessage(),
                 'file' => $e->getFile().':'.$e->getLine(),
             ]);
-
-            throw $e;
-        } finally {
-            self::releaseFileLock($lockHandle);
+            $state['status'] = 'failed';
+            $state['error'] = $e->getMessage() !== '' ? $e->getMessage() : $e::class;
+            self::saveBuildState($state);
         }
+
+        return $state;
     }
 
     /**
-     * @return resource
+     * @param  array<string, mixed>  $state
+     * @return array<string, mixed>
      */
-    protected static function acquireFileLock()
+    protected static function processOnePage(array $state): array
     {
-        $dir = storage_path('app');
-        if (! is_dir($dir)) {
-            @mkdir($dir, 0775, true);
+        $afterId = (int) ($state['after_id'] ?? 0);
+
+        $products = Database::retry(function () use ($afterId) {
+            Database::reconnect();
+
+            return Product::query()
+                ->with([
+                    'categories:id,name,url,parent_id',
+                    'categories.parentCategory:id,name,parent_id',
+                    'images:id,product_id,src',
+                ])
+                ->where('id', '>', $afterId)
+                ->orderBy('id')
+                ->limit(self::PAGE_SIZE)
+                ->get();
+        }, 5);
+
+        if ($products->isEmpty()) {
+            if ((int) ($state['total'] ?? 0) <= 0) {
+                $state['total'] = (int) ($state['processed'] ?? 0);
+            }
+
+            return self::finalizeBuild($state);
         }
 
-        $path = $dir.DIRECTORY_SEPARATOR.'product-feeds.generate.lock';
-        $handle = @fopen($path, 'c+');
+        $lines = [];
+        $seenIds = $state['seen_ids'] ?? [];
+        if (! is_array($seenIds)) {
+            $seenIds = [];
+        }
 
+        foreach ($products as $product) {
+            $state['after_id'] = (int) $product->id;
+            $state['processed'] = (int) ($state['processed'] ?? 0) + 1;
+
+            $row = self::mapProduct($product);
+            if ($row === null) {
+                $state['excluded'] = (int) ($state['excluded'] ?? 0) + 1;
+                $reason = self::$lastSkipReason ?? 'no_image';
+                if (isset($state['reasons'][$reason])) {
+                    $state['reasons'][$reason]++;
+                }
+
+                continue;
+            }
+
+            if (isset($seenIds[$row['id']])) {
+                $state['excluded'] = (int) ($state['excluded'] ?? 0) + 1;
+                $state['reasons']['duplicate_id'] = (int) ($state['reasons']['duplicate_id'] ?? 0) + 1;
+
+                continue;
+            }
+
+            $seenIds[$row['id']] = 1;
+            $state['included'] = (int) ($state['included'] ?? 0) + 1;
+            $lines[] = json_encode($row, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        }
+
+        if (count($seenIds) > 5000) {
+            $seenIds = array_slice($seenIds, -2000, preserve_keys: true);
+        }
+        $state['seen_ids'] = $seenIds;
+        $state['page'] = (int) ($state['page'] ?? 0) + 1;
+        $state['pages_total'] = max(
+            (int) ($state['pages_total'] ?? 1),
+            (int) $state['page'] + 1,
+        );
+
+        $total = (int) ($state['total'] ?? 0);
+        if ($total > 0) {
+            $state['percent'] = min(99, (int) floor(((int) $state['processed'] / $total) * 100));
+        } else {
+            $state['percent'] = min(95, (int) $state['page'] * 4);
+        }
+
+        if ($lines !== []) {
+            $path = Storage::disk('public')->path($state['build_dir'].'/items.jsonl');
+            file_put_contents($path, implode("\n", $lines)."\n", FILE_APPEND | LOCK_EX);
+        }
+
+        self::saveBuildState($state);
+
+        return $state;
+    }
+
+    /**
+     * @param  array<string, mixed>  $state
+     * @return array<string, mixed>
+     */
+    protected static function finalizeBuild(array $state): array
+    {
+        $state['status'] = 'finalizing';
+        $state['percent'] = 99;
+        self::saveBuildState($state);
+
+        $items = self::readBuildItems((string) $state['build_dir']);
+        $storeName = (string) (ShopSettings::get('store_name') ?: 'Mtoys');
+        $siteUrl = self::siteUrl();
+
+        Storage::disk('public')->makeDirectory(self::DIR);
+
+        $googleXml = self::buildGoogleXml($items, $storeName, $siteUrl);
+        $facebookCsv = self::buildFacebookCsv($items);
+
+        self::putAtomically(self::DIR.'/'.self::GOOGLE_FILE, $googleXml);
+        self::putAtomically(self::DIR.'/'.self::FACEBOOK_FILE, $facebookCsv);
+
+        Cache::forget(self::DIRTY_CACHE_KEY);
+
+        $meta = [
+            'google' => self::publicUrl('google'),
+            'facebook' => self::publicUrl('facebook'),
+            'count' => count($items),
+            'catalog_total' => (int) ($state['total'] ?? count($items)),
+            'excluded' => (int) ($state['excluded'] ?? 0),
+            'excluded_reasons' => $state['reasons'] ?? [],
+            'generated_at' => now()->toIso8601String(),
+            'google_bytes' => strlen($googleXml),
+            'facebook_bytes' => strlen($facebookCsv),
+        ];
+
+        Cache::forever(self::META_CACHE_KEY, $meta);
+
+        self::cleanupBuildDir((string) ($state['build_dir'] ?? ''));
+
+        $state['status'] = 'done';
+        $state['percent'] = 100;
+        $state['included'] = count($items);
+        $state['seen_ids'] = [];
+        $state['finished_at'] = now()->toIso8601String();
+        self::saveBuildState($state);
+
+        Log::channel('single')->info('product-feeds: paginated build done', [
+            'count' => $meta['count'],
+            'total' => $meta['catalog_total'],
+        ]);
+
+        // Коротко живёт для UI, потом можно очистить.
+        Cache::put(self::BUILD_CACHE_KEY, $state, now()->addMinutes(30));
+
+        return $state;
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    protected static function readBuildItems(string $buildDir): array
+    {
+        $path = Storage::disk('public')->path($buildDir.'/items.jsonl');
+        if (! is_file($path)) {
+            return [];
+        }
+
+        $items = [];
+        $handle = fopen($path, 'rb');
         if ($handle === false) {
-            throw new RuntimeException('Не удалось создать файл блокировки фидов: '.$path);
+            return [];
         }
 
-        // Неблокирующий захват: если уже идёт генерация — сразу понятная ошибка.
-        if (! flock($handle, LOCK_EX | LOCK_NB)) {
-            fclose($handle);
-            throw new RuntimeException('Генерация фидов уже выполняется. Подождите 1–2 минуты и повторите.');
+        while (($line = fgets($handle)) !== false) {
+            $line = trim($line);
+            if ($line === '') {
+                continue;
+            }
+            $row = json_decode($line, true);
+            if (is_array($row) && isset($row['id'])) {
+                $items[] = $row;
+            }
         }
 
-        ftruncate($handle, 0);
-        fwrite($handle, (string) getmypid());
-        fflush($handle);
+        fclose($handle);
 
-        return $handle;
+        return $items;
     }
 
-    /**
-     * @param  resource|null  $handle
-     */
-    protected static function releaseFileLock(mixed $handle): void
+    protected static function cleanupBuildDir(string $buildDir): void
     {
-        if (! is_resource($handle)) {
+        if ($buildDir === '' || ! str_starts_with($buildDir, self::DIR.'/build/')) {
             return;
         }
 
-        flock($handle, LOCK_UN);
-        fclose($handle);
+        Storage::disk('public')->deleteDirectory($buildDir);
+    }
+
+    public static function cancelBuild(): void
+    {
+        $state = Cache::get(self::BUILD_CACHE_KEY);
+        if (is_array($state) && ! empty($state['build_dir'])) {
+            self::cleanupBuildDir((string) $state['build_dir']);
+        }
+        Cache::forget(self::BUILD_CACHE_KEY);
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    public static function buildStatus(): ?array
+    {
+        $state = Cache::get(self::BUILD_CACHE_KEY);
+
+        return is_array($state) ? $state : null;
+    }
+
+    /**
+     * @param  array<string, mixed>  $state
+     */
+    protected static function saveBuildState(array $state): void
+    {
+        Cache::put(self::BUILD_CACHE_KEY, $state, now()->addHours(2));
     }
 
     /**
@@ -282,81 +503,6 @@ class ProductFeedService
     protected static function siteUrl(): string
     {
         return rtrim((string) config('app.url'), '/');
-    }
-
-    /**
-     * @return array{items: list<array<string, mixed>>, stats: array<string, mixed>}
-     */
-    protected static function collectItems(): array
-    {
-        $items = [];
-        $seenIds = [];
-        $stats = [
-            'total' => 0,
-            'excluded' => 0,
-            'reasons' => [
-                'no_name' => 0,
-                'no_price' => 0,
-                'no_image' => 0,
-                'no_url' => 0,
-                'duplicate_id' => 0,
-            ],
-        ];
-
-        $lastId = 0;
-        $guard = 0;
-
-        while (true) {
-            $guard++;
-            if ($guard > 5000) {
-                break;
-            }
-
-            $products = Database::retry(function () use ($lastId) {
-                return Product::query()
-                    ->with([
-                        'categories:id,name,url,parent_id',
-                        'categories.parentCategory:id,name,parent_id',
-                        'images:id,product_id,src',
-                    ])
-                    ->where('id', '>', $lastId)
-                    ->orderBy('id')
-                    ->limit(150)
-                    ->get();
-            });
-
-            if ($products->isEmpty()) {
-                break;
-            }
-
-            foreach ($products as $product) {
-                $lastId = (int) $product->id;
-                $stats['total']++;
-
-                $row = self::mapProduct($product);
-                if ($row === null) {
-                    $stats['excluded']++;
-                    $reason = self::$lastSkipReason ?? 'no_image';
-                    if (isset($stats['reasons'][$reason])) {
-                        $stats['reasons'][$reason]++;
-                    }
-
-                    continue;
-                }
-
-                if (isset($seenIds[$row['id']])) {
-                    $stats['excluded']++;
-                    $stats['reasons']['duplicate_id']++;
-
-                    continue;
-                }
-
-                $seenIds[$row['id']] = true;
-                $items[] = $row;
-            }
-        }
-
-        return ['items' => $items, 'stats' => $stats];
     }
 
     protected static ?string $lastSkipReason = null;
