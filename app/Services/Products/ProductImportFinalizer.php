@@ -3,7 +3,6 @@
 namespace App\Services\Products;
 
 use App\Models\ProductImport;
-use App\Services\ProductFeedService;
 use Illuminate\Bus\Batch;
 use Throwable;
 
@@ -46,14 +45,7 @@ class ProductImportFinalizer
 
         $import->finish($status, $error);
         ProductDataQuality::forgetCache();
-
-        if ($status === ProductImport::STATUS_COMPLETED) {
-            try {
-                ProductFeedService::generate();
-            } catch (Throwable) {
-                // импорт уже завершён — ошибка фида не должна его откатывать
-            }
-        }
+        // Фиды уже обновлены точечно через Product::saved при импорте.
     }
 
     private static function findImport(Batch $batch): ?ProductImport

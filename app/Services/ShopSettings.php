@@ -171,6 +171,7 @@ class ShopSettings
         }
 
         $updated = 0;
+        $touchedIds = [];
 
         Product::query()
             ->where(function ($query) {
@@ -181,7 +182,7 @@ class ShopSettings
                 });
             })
             ->orderBy('id')
-            ->chunkById(100, function ($products) use ($rate, &$updated) {
+            ->chunkById(100, function ($products) use ($rate, &$updated, &$touchedIds) {
                 foreach ($products as $product) {
                     $dirty = false;
 
@@ -197,17 +198,14 @@ class ShopSettings
 
                     if ($dirty) {
                         $product->saveQuietly();
+                        $touchedIds[] = (int) $product->id;
                         $updated++;
                     }
                 }
             });
 
-        if ($updated > 0 && class_exists(ProductFeedService::class)) {
-            try {
-                ProductFeedService::generate();
-            } catch (Throwable) {
-                // ignore feed errors
-            }
+        if ($touchedIds !== [] && class_exists(ProductFeedService::class)) {
+            ProductFeedService::syncMany($touchedIds);
         }
 
         return $updated;

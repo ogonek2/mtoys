@@ -6,20 +6,20 @@ use App\Services\ProductFeedService;
 use Illuminate\Console\Command;
 use Throwable;
 
+/**
+ * Аварийная/первичная полная сборка. В обычной работе не нужна —
+ * фиды правятся точечно при сохранении товаров.
+ */
 class GenerateProductFeedsCommand extends Command
 {
-    protected $signature = 'feeds:generate {--force : Принудительно}';
+    protected $signature = 'feeds:generate {--force : Пересобрать файлы с нуля}';
 
-    protected $description = 'Собрать Google/Facebook фиды из таблицы products';
+    protected $description = 'Первичная/аварийная полная сборка Google/Facebook фидов';
 
     public function handle(): int
     {
-        if (
-            ! $this->option('force')
-            && ! cache()->get(\App\Services\Feeds\FeedBuilder::DIRTY_KEY)
-            && ProductFeedService::exists('google')
-        ) {
-            $this->info('Фиды актуальны. --force для пересборки.');
+        if (! $this->option('force') && ProductFeedService::exists('google') && ProductFeedService::exists('facebook')) {
+            $this->info('Файлы уже есть. Точечные правки идут через товары. --force для полной пересборки.');
 
             return self::SUCCESS;
         }

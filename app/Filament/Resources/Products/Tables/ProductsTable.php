@@ -280,9 +280,10 @@ class ProductsTable
                                 ->native(false),
                         ])
                         ->action(function (Collection $records, array $data): void {
-                            self::updateWithoutFeedRebuild($records, ['availability' => $data['availability']]);
+                            $ids = $records->modelKeys();
+                            self::updateWithoutFeedEvents($records, ['availability' => $data['availability']]);
                             ProductDataQuality::forgetCache();
-                            ProductFeedService::schedule();
+                            ProductFeedService::syncMany($ids);
                         })
                         ->deselectRecordsAfterCompletion(),
 
@@ -298,16 +299,16 @@ class ProductsTable
                                 ->required(),
                         ])
                         ->action(function (Collection $records, array $data): void {
-                            self::updateWithoutFeedRebuild($records, ['discount' => (int) $data['discount']]);
+                            $ids = $records->modelKeys();
+                            self::updateWithoutFeedEvents($records, ['discount' => (int) $data['discount']]);
                             ProductDataQuality::forgetCache();
-                            ProductFeedService::schedule();
+                            ProductFeedService::syncMany($ids);
                         })
                         ->deselectRecordsAfterCompletion(),
 
                     DeleteBulkAction::make()
                         ->after(function (): void {
                             ProductDataQuality::forgetCache();
-                            ProductFeedService::schedule();
                         }),
                 ]),
             ]);
@@ -354,13 +355,12 @@ class ProductsTable
     }
 
     /**
-     * Массовое обновление без событий модели: иначе каждая запись
-     * заново собирает URL и фид товаров.
+     * Массовое обновление без событий модели (URL/фид — отдельно через syncMany).
      *
      * @param  Collection<int, Product>  $records
      * @param  array<string, mixed>  $attributes
      */
-    protected static function updateWithoutFeedRebuild(Collection $records, array $attributes): void
+    protected static function updateWithoutFeedEvents(Collection $records, array $attributes): void
     {
         Product::withoutEvents(function () use ($records, $attributes): void {
             Product::query()->whereKey($records->modelKeys())->update($attributes);

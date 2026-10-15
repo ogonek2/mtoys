@@ -8,7 +8,6 @@ use Filament\Actions\Action;
 use Filament\Forms\Components\TextInput;
 use Filament\Notifications\Notification;
 use Filament\Pages\Page;
-use Filament\Schemas\Components\Callout;
 use Filament\Schemas\Components\EmbeddedSchema;
 use Filament\Schemas\Components\Form;
 use Filament\Schemas\Components\Grid;
@@ -17,10 +16,7 @@ use Filament\Schemas\Components\Text;
 use Filament\Schemas\Schema;
 use Filament\Support\Enums\TextSize;
 use Filament\Support\Icons\Heroicon;
-use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Js;
-use Illuminate\Support\Str;
-use Throwable;
 use UnitEnum;
 
 /**
@@ -48,7 +44,7 @@ class ManageProductFeeds extends Page
 
     public function getSubheading(): ?string
     {
-        return 'Google Merchant и Facebook Catalog';
+        return 'URL для Google Merchant и Facebook Catalog. Обновляются автоматически при изменении товаров.';
     }
 
     public function defaultForm(Schema $schema): Schema
@@ -59,19 +55,12 @@ class ManageProductFeeds extends Page
     public function form(Schema $schema): Schema
     {
         return $schema->components([
-            Callout::make('Нужно обновить фиды')
-                ->description('Каталог менялся после последней сборки.')
-                ->warning()
-                ->icon(Heroicon::OutlinedExclamationTriangle)
-                ->visible(fn (): bool => (bool) ($this->data['dirty'] ?? false)),
-
             Section::make('Статус')
-                ->columns(4)
+                ->columns(3)
                 ->schema([
-                    TextInput::make('count')->label('В фиде')->disabled()->dehydrated(false),
-                    TextInput::make('catalog_total')->label('Просмотрено')->disabled()->dehydrated(false),
-                    TextInput::make('excluded')->label('Пропущено')->disabled()->dehydrated(false),
-                    TextInput::make('generated_at')->label('Собрано')->disabled()->dehydrated(false),
+                    TextInput::make('count')->label('Товаров в фиде')->disabled()->dehydrated(false),
+                    TextInput::make('generated_at')->label('Последнее обновление')->disabled()->dehydrated(false),
+                    TextInput::make('mode')->label('Режим')->disabled()->dehydrated(false),
                 ]),
 
             Grid::make(['default' => 1, 'lg' => 2])->schema([
@@ -125,38 +114,13 @@ class ManageProductFeeds extends Page
                 ->icon(Heroicon::OutlinedArrowTopRightOnSquare)
                 ->color('gray')
                 ->url(fn (): string => ProductFeedService::publicUrl('facebook'), shouldOpenInNewTab: true),
-            Action::make('generate')
-                ->label('Сгенерировать')
+            Action::make('refreshMeta')
+                ->label('Обновить статус')
                 ->icon(Heroicon::OutlinedArrowPath)
-                ->color('primary')
-                ->requiresConfirmation()
-                ->modalHeading('Собрать фиды из БД?')
-                ->modalDescription('Прямая выгрузка товаров в XML/CSV. Подождите до минуты.')
-                ->successNotification(null)
+                ->color('gray')
                 ->action(function (): void {
-                    @set_time_limit(0);
-                    @ini_set('max_execution_time', '0');
-
-                    try {
-                        $meta = ProductFeedService::generate();
-                    } catch (Throwable $e) {
-                        Log::error('feeds: admin failed', ['message' => $e->getMessage()]);
-                        Notification::make()
-                            ->title('Ошибка')
-                            ->body(Str::limit($e->getMessage() ?: $e::class, 400))
-                            ->danger()
-                            ->persistent()
-                            ->send();
-
-                        return;
-                    }
-
-                    $this->fillFromMeta($meta);
-                    Notification::make()
-                        ->title('Готово')
-                        ->body("В фиде: {$meta['count']} из {$meta['catalog_total']}")
-                        ->success()
-                        ->send();
+                    $this->fillFromMeta();
+                    Notification::make()->title('Статус обновлён')->success()->send();
                 }),
         ];
     }
@@ -178,12 +142,10 @@ class ManageProductFeeds extends Page
 
         $this->form->fill([
             'count' => (string) (int) ($meta['count'] ?? 0),
-            'catalog_total' => (string) (int) ($meta['catalog_total'] ?? 0),
-            'excluded' => (string) (int) ($meta['excluded'] ?? 0),
             'generated_at' => $at,
+            'mode' => 'Авто (по товарам)',
             'google' => (string) ($meta['google'] ?? ''),
             'facebook' => (string) ($meta['facebook'] ?? ''),
-            'dirty' => (bool) ($meta['dirty'] ?? false),
         ]);
     }
 }

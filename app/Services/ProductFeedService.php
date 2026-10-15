@@ -3,31 +3,77 @@
 namespace App\Services;
 
 use App\Services\Feeds\FeedBuilder;
+use Throwable;
 
 /**
- * Фасад для совместимости со старыми вызовами (Product, Import, ShopSettings).
+ * Фасад: точечное обновление фидов при изменении товаров.
+ * Полный rebuild — только если файлов ещё нет или через CLI.
  */
 class ProductFeedService
 {
-    public const DIRTY_CACHE_KEY = FeedBuilder::DIRTY_KEY;
-
-    public static function schedule(): void
+    /**
+     * Обновить один товар в фидах (create/update). При невалидных данных — удалить из фида.
+     */
+    public static function sync(int $productId): void
     {
-        app(FeedBuilder::class)->markDirty();
-    }
-
-    public static function flushDirty(): bool
-    {
-        if (! cache()->pull(FeedBuilder::DIRTY_KEY)) {
-            return false;
+        try {
+            app(FeedBuilder::class)->upsert($productId);
+        } catch (Throwable) {
+            // не блокируем CRUD из‑за фида
         }
-
-        self::generate();
-
-        return true;
     }
 
     /**
+     * @param  list<int>|iterable<int>  $productIds
+     */
+    public static function syncMany(iterable $productIds): void
+    {
+        try {
+            $ids = [];
+            foreach ($productIds as $id) {
+                $ids[] = (int) $id;
+            }
+            app(FeedBuilder::class)->upsertMany($ids);
+        } catch (Throwable) {
+        }
+    }
+
+    public static function remove(int $productId): void
+    {
+        try {
+            app(FeedBuilder::class)->remove($productId);
+        } catch (Throwable) {
+        }
+    }
+
+    /**
+     * @param  list<int>|iterable<int>  $productIds
+     */
+    public static function removeMany(iterable $productIds): void
+    {
+        try {
+            $ids = [];
+            foreach ($productIds as $id) {
+                $ids[] = (int) $id;
+            }
+            app(FeedBuilder::class)->removeMany($ids);
+        } catch (Throwable) {
+        }
+    }
+
+    /**
+     * @deprecated Используйте sync() — оставлено для старых вызовов.
+     */
+    public static function schedule(?int $productId = null): void
+    {
+        if ($productId !== null) {
+            self::sync($productId);
+        }
+    }
+
+    /**
+     * Полная сборка (CLI / первичная). Не для админ-кнопки.
+     *
      * @return array<string, mixed>
      */
     public static function generate(): array

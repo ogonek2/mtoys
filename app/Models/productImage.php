@@ -17,17 +17,15 @@ class productImage extends Model
 
     protected static function booted(): void
     {
-        static::saved(function (): void {
-            try {
-                ProductFeedService::schedule();
-            } catch (\Throwable) {
+        static::saved(function (productImage $image): void {
+            if ($image->product_id) {
+                ProductFeedService::sync((int) $image->product_id);
             }
         });
 
-        static::deleted(function (): void {
-            try {
-                ProductFeedService::schedule();
-            } catch (\Throwable) {
+        static::deleted(function (productImage $image): void {
+            if ($image->product_id) {
+                ProductFeedService::sync((int) $image->product_id);
             }
         });
     }

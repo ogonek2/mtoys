@@ -12,6 +12,7 @@
 
     <meta name="theme-color" content="#0E3A45">
     <meta name="csrf-token" content="{{ csrf_token() }}">
+    <meta name="google-site-verification" content="LBy0z1tRFs9ac4nYe5DoEnM2Fs1d4wqFgu7-7EVuMkQ" />
     <link rel="manifest" href="/build/manifest.webmanifest">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">

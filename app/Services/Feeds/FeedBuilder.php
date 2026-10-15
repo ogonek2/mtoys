@@ -14,10 +14,9 @@ use RuntimeException;
 use Throwable;
 
 /**
- * Сбор Google/Facebook фидов с нуля:
- * — только Query Builder (без Eloquent-связей);
- * — короткие поля;
- * — пишем файлы потоком, пока не кончатся строки в БД.
+ * Товарные фиды без «общего сбора» из админки:
+ * — первичная сборка (если файлов ещё нет) или CLI;
+ * — дальше только точечный upsert/remove по id товара.
  */
 final class FeedBuilder
 {
@@ -29,8 +28,6 @@ final class FeedBuilder
 
     public const META_KEY = 'product-feeds.meta';
 
-    public const DIRTY_KEY = 'product-feeds.dirty';
-
     private const BATCH = 100;
 
     private const TITLE_MAX = 100;
@@ -38,6 +35,8 @@ final class FeedBuilder
     private const DESC_MAX = 300;
 
     /**
+     * Полная первичная сборка (или аварийный CLI). Не для UI.
+     *
      * @return array<string, mixed>
      */
     public function build(): array
@@ -45,10 +44,9 @@ final class FeedBuilder
         @set_time_limit(0);
         @ini_set('max_execution_time', '0');
         @ini_set('memory_limit', '256M');
-        ignore_user_abort(true);
 
         $t0 = microtime(true);
-        Log::info('feeds: build start');
+        Log::info('feeds: full build start');
 
         Storage::disk('public')->makeDirectory(self::DIR);
 
@@ -87,9 +85,7 @@ final class FeedBuilder
                 ));
 
                 foreach ($rows as $row) {
-                    $afterId = (int) $row->id;
                     $scanned++;
-
                     $item = $this->mapRow($row, $store, $site, $categoryByProduct[(int) $row->id] ?? null);
                     if ($item === null) {
                         $skipped++;
@@ -102,24 +98,15 @@ final class FeedBuilder
                     $written++;
                 }
 
-                // Явно двигаем курсор вперёд по последнему id батча.
                 $afterId = (int) $rows[array_key_last($rows)]->id;
-
                 unset($rows);
-                if ($scanned % 300 === 0) {
-                    Log::info('feeds: progress', compact('scanned', 'written', 'afterId'));
-                }
             }
         } catch (Throwable $e) {
             fclose($g);
             fclose($f);
             @unlink($googleTmp);
             @unlink($facebookTmp);
-            Log::error('feeds: build failed', [
-                'message' => $e->getMessage(),
-                'scanned' => $scanned,
-                'afterId' => $afterId,
-            ]);
+            Log::error('feeds: full build failed', ['message' => $e->getMessage()]);
             throw $e;
         }
 
@@ -127,32 +114,203 @@ final class FeedBuilder
         fclose($g);
         fclose($f);
 
-        $this->publish(self::DIR.'/'.self::GOOGLE, $googleTmp);
-        $this->publish(self::DIR.'/'.self::FACEBOOK, $facebookTmp);
+        $this->withLock(function () use ($googleTmp, $facebookTmp): void {
+            $this->publish(self::DIR.'/'.self::GOOGLE, $googleTmp);
+            $this->publish(self::DIR.'/'.self::FACEBOOK, $facebookTmp);
+        });
 
-        Cache::forget(self::DIRTY_KEY);
-
-        $meta = [
-            'google' => route('feeds.google'),
-            'facebook' => route('feeds.facebook'),
-            'count' => $written,
-            'catalog_total' => $scanned,
-            'excluded' => $skipped,
-            'generated_at' => now()->toIso8601String(),
-            'google_bytes' => (int) filesize($this->abs(self::DIR.'/'.self::GOOGLE)),
-            'facebook_bytes' => (int) filesize($this->abs(self::DIR.'/'.self::FACEBOOK)),
-        ];
-
-        Cache::forever(self::META_KEY, $meta);
-
-        Log::info('feeds: build done', [
+        $meta = $this->storeMeta($written, $scanned, $skipped);
+        Log::info('feeds: full build done', [
             'written' => $written,
             'scanned' => $scanned,
-            'skipped' => $skipped,
             'sec' => round(microtime(true) - $t0, 2),
         ]);
 
         return $meta;
+    }
+
+    /**
+     * Создать/обновить товар в фидах. Если товар невалиден — удалить из фидов.
+     */
+    public function upsert(int $productId): void
+    {
+        $this->ensureFiles();
+
+        $item = $this->itemForId($productId);
+        if ($item === null) {
+            $this->remove($productId);
+
+            return;
+        }
+
+        $googleBlock = $this->googleItemXml($item);
+        $facebookRow = $this->facebookCsvRow($item);
+
+        $this->withLock(function () use ($productId, $googleBlock, $facebookRow): void {
+            $this->patchGoogleMany([$productId => ['_raw' => $googleBlock]]);
+            $this->patchFacebookMany([$productId => ['_raw' => $facebookRow]]);
+            $this->refreshMetaFromFiles();
+        });
+    }
+
+    /**
+     * @param  list<int>  $productIds
+     */
+    public function upsertMany(array $productIds): void
+    {
+        $ids = array_values(array_unique(array_filter(array_map('intval', $productIds))));
+        if ($ids === []) {
+            return;
+        }
+
+        $this->ensureFiles();
+
+        /** @var array<int, array<string, mixed>|null> $items */
+        $items = [];
+        foreach (array_chunk($ids, self::BATCH) as $chunk) {
+            foreach ($chunk as $id) {
+                $items[$id] = $this->itemForId($id);
+            }
+        }
+
+        $this->withLock(function () use ($items): void {
+            $this->patchGoogleMany($items);
+            $this->patchFacebookMany($items);
+            $this->refreshMetaFromFiles();
+        });
+    }
+
+    public function remove(int $productId): void
+    {
+        if (! $this->exists('google') && ! $this->exists('facebook')) {
+            return;
+        }
+
+        $this->withLock(function () use ($productId): void {
+            if ($this->exists('google')) {
+                $this->patchGoogle($productId, null);
+            }
+            if ($this->exists('facebook')) {
+                $this->patchFacebook($productId, null);
+            }
+            $this->refreshMetaFromFiles();
+        });
+    }
+
+    /**
+     * @param  list<int>  $productIds
+     */
+    public function removeMany(array $productIds): void
+    {
+        $ids = array_values(array_unique(array_filter(array_map('intval', $productIds))));
+        if ($ids === [] || (! $this->exists('google') && ! $this->exists('facebook'))) {
+            return;
+        }
+
+        $items = [];
+        foreach ($ids as $id) {
+            $items[$id] = null;
+        }
+
+        $this->withLock(function () use ($items): void {
+            if ($this->exists('google')) {
+                $this->patchGoogleMany($items);
+            }
+            if ($this->exists('facebook')) {
+                $this->patchFacebookMany($items);
+            }
+            $this->refreshMetaFromFiles();
+        });
+    }
+
+    public function ensureFiles(): void
+    {
+        if ($this->exists('google') && $this->exists('facebook')) {
+            return;
+        }
+
+        $this->build();
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function meta(): array
+    {
+        $meta = Cache::get(self::META_KEY);
+        if (! is_array($meta)) {
+            $meta = [];
+        }
+
+        $googlePath = self::DIR.'/'.self::GOOGLE;
+        $facebookPath = self::DIR.'/'.self::FACEBOOK;
+        $googleExists = Storage::disk('public')->exists($googlePath);
+        $facebookExists = Storage::disk('public')->exists($facebookPath);
+
+        if ($googleExists && empty($meta['count'])) {
+            $this->refreshMetaFromFiles();
+            $meta = Cache::get(self::META_KEY) ?: [];
+        }
+
+        return [
+            'google' => route('feeds.google'),
+            'facebook' => route('feeds.facebook'),
+            'count' => (int) ($meta['count'] ?? 0),
+            'catalog_total' => (int) ($meta['catalog_total'] ?? ($meta['count'] ?? 0)),
+            'excluded' => (int) ($meta['excluded'] ?? 0),
+            'generated_at' => $meta['generated_at'] ?? null,
+            'google_bytes' => (int) ($meta['google_bytes'] ?? 0),
+            'facebook_bytes' => (int) ($meta['facebook_bytes'] ?? 0),
+            'google_exists' => $googleExists,
+            'facebook_exists' => $facebookExists,
+        ];
+    }
+
+    public function exists(string $type): bool
+    {
+        $file = $type === 'facebook' ? self::FACEBOOK : self::GOOGLE;
+
+        return Storage::disk('public')->exists(self::DIR.'/'.$file);
+    }
+
+    public function fileContents(string $type): ?string
+    {
+        $this->ensureFiles();
+        $file = $type === 'facebook' ? self::FACEBOOK : self::GOOGLE;
+        $path = self::DIR.'/'.$file;
+
+        if (! Storage::disk('public')->exists($path)) {
+            return null;
+        }
+
+        return Storage::disk('public')->get($path);
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    private function itemForId(int $productId): ?array
+    {
+        $row = Database::retry(static function () use ($productId) {
+            return DB::table('products')
+                ->select([
+                    'id', 'name', 'articule', 'price', 'discount',
+                    'discount_starts_at', 'discount_ends_at', 'image_path',
+                    'url', 'availability', 'condition_item', 'brand', 'seo_description',
+                ])
+                ->where('id', $productId)
+                ->first();
+        }, 3);
+
+        if ($row === null) {
+            return null;
+        }
+
+        $store = (string) (ShopSettings::get('store_name') ?: 'Mtoys');
+        $site = rtrim((string) config('app.url'), '/');
+        $cats = $this->categoriesForIds([$productId]);
+
+        return $this->mapRow($row, $store, $site, $cats[$productId] ?? null);
     }
 
     /**
@@ -161,22 +319,11 @@ final class FeedBuilder
     private function fetchBatch(int $afterId): array
     {
         return Database::retry(function () use ($afterId) {
-            // reconnect только при ошибке внутри Database::retry
             return DB::table('products')
                 ->select([
-                    'id',
-                    'name',
-                    'articule',
-                    'price',
-                    'discount',
-                    'discount_starts_at',
-                    'discount_ends_at',
-                    'image_path',
-                    'url',
-                    'availability',
-                    'condition_item',
-                    'brand',
-                    'seo_description',
+                    'id', 'name', 'articule', 'price', 'discount',
+                    'discount_starts_at', 'discount_ends_at', 'image_path',
+                    'url', 'availability', 'condition_item', 'brand', 'seo_description',
                 ])
                 ->where('id', '>', $afterId)
                 ->orderBy('id')
@@ -366,9 +513,7 @@ final class FeedBuilder
         return trim($text, '-');
     }
 
-    /**
-     * @param  resource  $g
-     */
+    /** @param  resource  $g */
     private function writeGoogleHeader($g, string $store, string $site): void
     {
         fwrite($g, '<?xml version="1.0" encoding="UTF-8"?>'."\n");
@@ -379,9 +524,7 @@ final class FeedBuilder
         fwrite($g, '    <description>'.$this->xml($store.' product feed')."</description>\n");
     }
 
-    /**
-     * @param  resource  $f
-     */
+    /** @param  resource  $f */
     private function writeFacebookHeader($f): void
     {
         fwrite($f, "\xEF\xBB\xBF");
@@ -397,29 +540,7 @@ final class FeedBuilder
      */
     private function writeGoogleItem($g, array $item): void
     {
-        fwrite($g, "    <item>\n");
-        $this->g($g, 'id', $item['id']);
-        $this->g($g, 'title', $item['title']);
-        $this->g($g, 'description', $item['description']);
-        $this->g($g, 'link', $item['link']);
-        $this->g($g, 'image_link', $item['image_link']);
-        $this->g($g, 'availability', $item['availability']);
-        $this->g($g, 'condition', $item['condition']);
-        $this->g($g, 'price', $item['price']);
-        if ($item['sale_price'] !== '') {
-            $this->g($g, 'sale_price', $item['sale_price']);
-        }
-        $this->g($g, 'brand', $item['brand']);
-        if ($item['mpn'] !== '') {
-            $this->g($g, 'mpn', $item['mpn']);
-        }
-        $this->g($g, 'identifier_exists', $item['mpn'] !== '' ? 'yes' : 'no');
-        fwrite($g, "      <g:shipping>\n");
-        $this->g($g, 'country', 'UA', 8);
-        $this->g($g, 'service', 'Standard', 8);
-        $this->g($g, 'price', '0.00 UAH', 8);
-        fwrite($g, "      </g:shipping>\n");
-        fwrite($g, "    </item>\n");
+        fwrite($g, $this->googleItemXml($item));
     }
 
     /**
@@ -428,7 +549,50 @@ final class FeedBuilder
      */
     private function writeFacebookItem($f, array $item): void
     {
-        fputcsv($f, [
+        fputcsv($f, $this->facebookCsvFields($item));
+    }
+
+    /**
+     * @param  array<string, mixed>  $item
+     */
+    private function googleItemXml(array $item): string
+    {
+        $pad = str_repeat(' ', 6);
+        $pad8 = str_repeat(' ', 8);
+        $out = "    <item>\n";
+        $out .= $pad.'<g:id>'.$this->xml($item['id'])."</g:id>\n";
+        $out .= $pad.'<g:title>'.$this->xml($item['title'])."</g:title>\n";
+        $out .= $pad.'<g:description>'.$this->xml($item['description'])."</g:description>\n";
+        $out .= $pad.'<g:link>'.$this->xml($item['link'])."</g:link>\n";
+        $out .= $pad.'<g:image_link>'.$this->xml($item['image_link'])."</g:image_link>\n";
+        $out .= $pad.'<g:availability>'.$this->xml($item['availability'])."</g:availability>\n";
+        $out .= $pad.'<g:condition>'.$this->xml($item['condition'])."</g:condition>\n";
+        $out .= $pad.'<g:price>'.$this->xml($item['price'])."</g:price>\n";
+        if ($item['sale_price'] !== '') {
+            $out .= $pad.'<g:sale_price>'.$this->xml($item['sale_price'])."</g:sale_price>\n";
+        }
+        $out .= $pad.'<g:brand>'.$this->xml($item['brand'])."</g:brand>\n";
+        if ($item['mpn'] !== '') {
+            $out .= $pad.'<g:mpn>'.$this->xml($item['mpn'])."</g:mpn>\n";
+        }
+        $out .= $pad.'<g:identifier_exists>'.$this->xml($item['mpn'] !== '' ? 'yes' : 'no')."</g:identifier_exists>\n";
+        $out .= "      <g:shipping>\n";
+        $out .= $pad8.'<g:country>UA</g:country>'."\n";
+        $out .= $pad8.'<g:service>Standard</g:service>'."\n";
+        $out .= $pad8.'<g:price>0.00 UAH</g:price>'."\n";
+        $out .= "      </g:shipping>\n";
+        $out .= "    </item>\n";
+
+        return $out;
+    }
+
+    /**
+     * @param  array<string, mixed>  $item
+     * @return list<string>
+     */
+    private function facebookCsvFields(array $item): array
+    {
+        return [
             $item['id'],
             $item['title'],
             $item['description'],
@@ -441,15 +605,216 @@ final class FeedBuilder
             $item['sale_price'],
             $item['mpn'],
             'active',
-        ]);
+        ];
     }
 
     /**
-     * @param  resource  $g
+     * @param  array<string, mixed>  $item
      */
-    private function g($g, string $name, string $value, int $pad = 6): void
+    private function facebookCsvRow(array $item): string
     {
-        fwrite($g, str_repeat(' ', $pad).'<g:'.$name.'>'.$this->xml($value).'</g:'.$name.">\n");
+        $fh = fopen('php://temp', 'r+b');
+        if ($fh === false) {
+            throw new RuntimeException('Cannot open temp stream');
+        }
+        fputcsv($fh, $this->facebookCsvFields($item));
+        rewind($fh);
+        $line = stream_get_contents($fh);
+        fclose($fh);
+
+        return rtrim((string) $line, "\r\n");
+    }
+
+    /** @param  ?string  $block  null = удалить */
+    private function patchGoogle(int $productId, ?string $block): void
+    {
+        $this->patchGoogleMany([$productId => $block === null ? null : ['_raw' => $block]]);
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>|null>  $items  null = удалить; массив item или ['_raw'=>xml]
+     */
+    private function patchGoogleMany(array $items): void
+    {
+        if ($items === []) {
+            return;
+        }
+
+        $path = $this->abs(self::DIR.'/'.self::GOOGLE);
+        if (! is_file($path)) {
+            return;
+        }
+
+        $xml = (string) file_get_contents($path);
+        $append = '';
+
+        foreach ($items as $productId => $item) {
+            $block = null;
+            if (is_array($item)) {
+                $block = isset($item['_raw']) ? (string) $item['_raw'] : $this->googleItemXml($item);
+            }
+
+            $pattern = '/\s*<item>\s*<g:id>'.preg_quote((string) $productId, '/').'<\/g:id>.*?<\/item>/s';
+
+            if (preg_match($pattern, $xml) === 1) {
+                $xml = $block === null
+                    ? (string) preg_replace($pattern, '', $xml, 1)
+                    : (string) preg_replace($pattern, "\n".$block, $xml, 1);
+            } elseif ($block !== null) {
+                $append .= $block;
+            }
+        }
+
+        if ($append !== '') {
+            if (! str_contains($xml, '</channel>')) {
+                throw new RuntimeException('Invalid google feed: missing </channel>');
+            }
+            $xml = str_replace('  </channel>', $append.'  </channel>', $xml);
+        }
+
+        $tmp = $path.'.patch';
+        if (file_put_contents($tmp, $xml) === false || ! @rename($tmp, $path)) {
+            @unlink($tmp);
+            throw new RuntimeException('Cannot write google feed patch');
+        }
+    }
+
+    /** @param  ?string  $row  null = удалить */
+    private function patchFacebook(int $productId, ?string $row): void
+    {
+        $this->patchFacebookMany([$productId => $row === null ? null : ['_raw' => $row]]);
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>|null>  $items
+     */
+    private function patchFacebookMany(array $items): void
+    {
+        if ($items === []) {
+            return;
+        }
+
+        $path = $this->abs(self::DIR.'/'.self::FACEBOOK);
+        if (! is_file($path)) {
+            return;
+        }
+
+        $rowsById = [];
+        foreach ($items as $productId => $item) {
+            if ($item === null) {
+                $rowsById[(string) $productId] = null;
+            } elseif (isset($item['_raw'])) {
+                $rowsById[(string) $productId] = (string) $item['_raw'];
+            } else {
+                $rowsById[(string) $productId] = $this->facebookCsvRow($item);
+            }
+        }
+
+        $raw = (string) file_get_contents($path);
+        $bom = str_starts_with($raw, "\xEF\xBB\xBF") ? "\xEF\xBB\xBF" : '';
+        $body = $bom !== '' ? substr($raw, 3) : $raw;
+        $lines = preg_split("/\r\n|\n|\r/", $body) ?: [];
+        if ($lines === []) {
+            return;
+        }
+
+        $header = array_shift($lines);
+        $seen = [];
+        $out = [];
+
+        foreach ($lines as $line) {
+            if ($line === '') {
+                continue;
+            }
+            $cols = str_getcsv($line);
+            $lineId = (string) ($cols[0] ?? '');
+            if (array_key_exists($lineId, $rowsById)) {
+                $seen[$lineId] = true;
+                if ($rowsById[$lineId] !== null) {
+                    $out[] = $rowsById[$lineId];
+                }
+
+                continue;
+            }
+            $out[] = $line;
+        }
+
+        foreach ($rowsById as $id => $row) {
+            if ($row !== null && ! isset($seen[$id])) {
+                $out[] = $row;
+            }
+        }
+
+        $content = $bom.$header."\n";
+        if ($out !== []) {
+            $content .= implode("\n", $out)."\n";
+        }
+
+        $tmp = $path.'.patch';
+        if (file_put_contents($tmp, $content) === false || ! @rename($tmp, $path)) {
+            @unlink($tmp);
+            throw new RuntimeException('Cannot write facebook feed patch');
+        }
+    }
+
+    private function withLock(callable $callback): void
+    {
+        Storage::disk('public')->makeDirectory(self::DIR);
+        $lockPath = $this->abs(self::DIR.'/.lock');
+        $fh = fopen($lockPath, 'c+');
+        if ($fh === false) {
+            throw new RuntimeException('Cannot open feed lock');
+        }
+
+        try {
+            if (! flock($fh, LOCK_EX)) {
+                throw new RuntimeException('Cannot lock feeds');
+            }
+            $callback();
+        } finally {
+            flock($fh, LOCK_UN);
+            fclose($fh);
+        }
+    }
+
+    private function refreshMetaFromFiles(): void
+    {
+        $googlePath = $this->abs(self::DIR.'/'.self::GOOGLE);
+        $facebookPath = $this->abs(self::DIR.'/'.self::FACEBOOK);
+        $count = 0;
+        $gBytes = 0;
+        $fBytes = 0;
+
+        if (is_file($googlePath)) {
+            $xml = (string) file_get_contents($googlePath);
+            $count = substr_count($xml, '<item>');
+            $gBytes = strlen($xml);
+        }
+        if (is_file($facebookPath)) {
+            $fBytes = (int) filesize($facebookPath);
+        }
+
+        $this->storeMeta($count, $count, 0, $gBytes, $fBytes);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function storeMeta(int $written, int $scanned, int $skipped, ?int $gBytes = null, ?int $fBytes = null): array
+    {
+        $meta = [
+            'google' => route('feeds.google'),
+            'facebook' => route('feeds.facebook'),
+            'count' => $written,
+            'catalog_total' => $scanned,
+            'excluded' => $skipped,
+            'generated_at' => now()->toIso8601String(),
+            'google_bytes' => $gBytes ?? (int) (@filesize($this->abs(self::DIR.'/'.self::GOOGLE)) ?: 0),
+            'facebook_bytes' => $fBytes ?? (int) (@filesize($this->abs(self::DIR.'/'.self::FACEBOOK)) ?: 0),
+        ];
+        Cache::forever(self::META_KEY, $meta);
+
+        return $meta;
     }
 
     private function xml(string $value): string
@@ -472,72 +837,5 @@ final class FeedBuilder
             throw new RuntimeException('Cannot publish '.$relative);
         }
         @unlink($tmpAbs);
-    }
-
-    /**
-     * @return array<string, mixed>
-     */
-    public function meta(): array
-    {
-        $meta = Cache::get(self::META_KEY);
-        if (! is_array($meta)) {
-            $meta = [];
-        }
-
-        $googlePath = self::DIR.'/'.self::GOOGLE;
-        $facebookPath = self::DIR.'/'.self::FACEBOOK;
-        $googleExists = Storage::disk('public')->exists($googlePath);
-        $facebookExists = Storage::disk('public')->exists($facebookPath);
-
-        if ($googleExists) {
-            $xml = (string) Storage::disk('public')->get($googlePath);
-            $n = substr_count($xml, '<item>');
-            if ($n > 0) {
-                $meta['count'] = $n;
-                $meta['google_bytes'] = strlen($xml);
-            }
-        }
-
-        return [
-            'google' => route('feeds.google'),
-            'facebook' => route('feeds.facebook'),
-            'count' => (int) ($meta['count'] ?? 0),
-            'catalog_total' => (int) ($meta['catalog_total'] ?? 0),
-            'excluded' => (int) ($meta['excluded'] ?? 0),
-            'generated_at' => $meta['generated_at'] ?? null,
-            'google_bytes' => (int) ($meta['google_bytes'] ?? 0),
-            'facebook_bytes' => (int) ($meta['facebook_bytes'] ?? 0),
-            'dirty' => (bool) Cache::get(self::DIRTY_KEY),
-            'google_exists' => $googleExists,
-            'facebook_exists' => $facebookExists,
-        ];
-    }
-
-    public function exists(string $type): bool
-    {
-        $file = $type === 'facebook' ? self::FACEBOOK : self::GOOGLE;
-
-        return Storage::disk('public')->exists(self::DIR.'/'.$file);
-    }
-
-    public function fileContents(string $type): ?string
-    {
-        $file = $type === 'facebook' ? self::FACEBOOK : self::GOOGLE;
-        $path = self::DIR.'/'.$file;
-
-        if (! Storage::disk('public')->exists($path)) {
-            try {
-                $this->build();
-            } catch (Throwable) {
-                return null;
-            }
-        }
-
-        return Storage::disk('public')->get($path);
-    }
-
-    public function markDirty(): void
-    {
-        Cache::put(self::DIRTY_KEY, true, now()->addHours(6));
     }
 }

@@ -336,21 +336,12 @@ class Product extends Model
         });
 
         static::saved(function ($product) {
-            self::regenerateFeed();
+            ProductFeedService::sync((int) $product->id);
         });
 
         static::deleted(function ($product) {
-            self::regenerateFeed();
+            ProductFeedService::remove((int) $product->id);
         });
-    }
-
-    protected static function regenerateFeed(): void
-    {
-        try {
-            ProductFeedService::schedule();
-        } catch (\Throwable) {
-            // не блокируем сохранение товара из‑за фида
-        }
     }
 
     // Метод для генерации href
