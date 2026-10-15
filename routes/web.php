@@ -8,6 +8,7 @@ use App\Http\Controllers\ContactController;
 use App\Http\Controllers\CsrfTokenController;
 use App\Http\Controllers\SpaApiController;
 use App\Http\Controllers\SpaShellController;
+use App\Http\Controllers\ProductFeedController;
 
 use App\Http\Controllers\AdminProductsUploadController;
 use App\Http\Controllers\admin\AdminMainController;
@@ -31,6 +32,9 @@ use App\Filament\Resources\ProductResource\Pages\ManageGallery;
 
 Route::get('/', [SpaShellController::class, 'home'])->name('welcome');
 Route::get('/home', [SpaShellController::class, 'home'])->name('home');
+
+Route::get('/feeds/google.xml', [ProductFeedController::class, 'google'])->name('feeds.google');
+Route::get('/feeds/facebook.csv', [ProductFeedController::class, 'facebook'])->name('feeds.facebook');
 Route::get('/thank-you', function() {
     return view('thanks_you_page');
 })->name('thanks');

@@ -4,6 +4,7 @@ namespace App\Filament\Resources\Products\Tables;
 
 use App\Filament\Support\ShopOptions;
 use App\Models\Product;
+use App\Services\ProductFeedService;
 use App\Services\Products\ProductDataQuality;
 use Filament\Actions\BulkAction;
 use Filament\Actions\BulkActionGroup;
@@ -281,6 +282,7 @@ class ProductsTable
                         ->action(function (Collection $records, array $data): void {
                             self::updateWithoutFeedRebuild($records, ['availability' => $data['availability']]);
                             ProductDataQuality::forgetCache();
+                            ProductFeedService::schedule();
                         })
                         ->deselectRecordsAfterCompletion(),
 
@@ -298,11 +300,15 @@ class ProductsTable
                         ->action(function (Collection $records, array $data): void {
                             self::updateWithoutFeedRebuild($records, ['discount' => (int) $data['discount']]);
                             ProductDataQuality::forgetCache();
+                            ProductFeedService::schedule();
                         })
                         ->deselectRecordsAfterCompletion(),
 
                     DeleteBulkAction::make()
-                        ->after(fn () => ProductDataQuality::forgetCache()),
+                        ->after(function (): void {
+                            ProductDataQuality::forgetCache();
+                            ProductFeedService::schedule();
+                        }),
                 ]),
             ]);
     }

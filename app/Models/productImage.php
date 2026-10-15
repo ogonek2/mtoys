@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use App\Helpers\FileUploadHelper;
+use App\Services\ProductFeedService;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
@@ -13,6 +14,23 @@ class productImage extends Model
     protected $fillable = [
         'src', 'product_id',
     ];
+
+    protected static function booted(): void
+    {
+        static::saved(function (): void {
+            try {
+                ProductFeedService::schedule();
+            } catch (\Throwable) {
+            }
+        });
+
+        static::deleted(function (): void {
+            try {
+                ProductFeedService::schedule();
+            } catch (\Throwable) {
+            }
+        });
+    }
 
     public function product()
     {

@@ -344,10 +344,12 @@ class Product extends Model
         });
     }
 
-    protected static function regenerateFeed()
+    protected static function regenerateFeed(): void
     {
-        if (class_exists(ProductFeedService::class)) {
-            ProductFeedService::generate();
+        try {
+            ProductFeedService::schedule();
+        } catch (\Throwable) {
+            // не блокируем сохранение товара из‑за фида
         }
     }
 
