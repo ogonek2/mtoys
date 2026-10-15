@@ -27,8 +27,10 @@ class ProductFeedService
 
     public const BUILD_CACHE_KEY = 'product-feeds.build';
 
-    /** Размер страницы для веб-генерации (короткий HTTP-запрос). */
-    public const PAGE_SIZE = 40;
+    /** Размер страницы обхода каталога. */
+    public const PAGE_SIZE = 100;
+
+    public const CANCEL_FLAG_KEY = 'product-feeds.cancel';
 
     /**
      * Пометить фиды устаревшими. Полная пересборка — кроном / вручную
@@ -51,7 +53,7 @@ class ProductFeedService
     }
 
     /**
-     * Полная генерация (CLI / крон): крутит страницы до конца.
+     * Полная генерация (CLI / крон / фон из админки).
      *
      * @return array<string, mixed>
      */
@@ -59,13 +61,23 @@ class ProductFeedService
     {
         @set_time_limit(0);
         @ini_set('memory_limit', '512M');
+        Cache::forget(self::CANCEL_FLAG_KEY);
 
         self::startBuild();
 
         $guard = 0;
         while ($guard < 5000) {
             $guard++;
-            $state = self::processNextPages(app()->runningInConsole() ? 10 : 1);
+
+            if (Cache::pull(self::CANCEL_FLAG_KEY)) {
+                $state = self::buildStatus() ?? [];
+                $state['status'] = 'failed';
+                $state['error'] = 'Сборка остановлена пользователем.';
+                self::saveBuildState($state);
+                break;
+            }
+
+            $state = self::processNextPages(5);
             $status = (string) ($state['status'] ?? '');
             if (in_array($status, ['done', 'failed', 'idle'], true)) {
                 break;
@@ -84,13 +96,61 @@ class ProductFeedService
     }
 
     /**
+     * Запуск полной генерации в фоне (админка только показывает прогресс).
+     */
+    public static function runInBackground(): void
+    {
+        // Не ставим cancel-флаг — иначе сразу же убьём новый CLI-процесс.
+        self::resetBuildArtifacts();
+        Cache::forget(self::CANCEL_FLAG_KEY);
+
+        Cache::put(self::BUILD_CACHE_KEY, [
+            'status' => 'queued',
+            'percent' => 1,
+            'total' => 0,
+            'processed' => 0,
+            'included' => 0,
+            'excluded' => 0,
+            'page' => 0,
+            'pages_total' => 0,
+            'error' => null,
+            'started_at' => now()->toIso8601String(),
+        ], now()->addHours(2));
+
+        $php = PHP_BINARY;
+        $artisan = base_path('artisan');
+        $log = storage_path('logs/feeds-generate.log');
+        $cwd = base_path();
+
+        if (PHP_OS_FAMILY === 'Windows') {
+            $cmd = 'start /B "" '.escapeshellarg($php).' '.escapeshellarg($artisan)
+                .' feeds:generate --force >> '.escapeshellarg($log).' 2>&1';
+            pclose(popen($cmd, 'r'));
+        } else {
+            $cmd = sprintf(
+                'cd %s && nohup %s -d max_execution_time=0 %s feeds:generate --force >> %s 2>&1 &',
+                escapeshellarg($cwd),
+                escapeshellarg($php),
+                escapeshellarg($artisan),
+                escapeshellarg($log)
+            );
+            exec($cmd);
+        }
+
+        Log::channel('single')->info('product-feeds: background generate dispatched', [
+            'php' => $php,
+        ]);
+    }
+
+    /**
      * Старт постраничной сборки (админка / CLI).
      *
      * @return array<string, mixed>
      */
     public static function startBuild(): array
     {
-        self::cancelBuild();
+        self::resetBuildArtifacts();
+        Cache::forget(self::CANCEL_FLAG_KEY);
 
         $total = 0;
         try {
@@ -214,7 +274,23 @@ class ProductFeedService
     {
         $afterId = (int) ($state['after_id'] ?? 0);
 
-        $products = Database::retry(function () use ($afterId) {
+        // Сначала лёгкий pluck id (без with) — ProxySQL стабильнее; потом догрузка связей.
+        $ids = Database::retry(function () use ($afterId) {
+            Database::reconnect();
+
+            return Product::query()
+                ->where('id', '>', $afterId)
+                ->orderBy('id')
+                ->limit(self::PAGE_SIZE)
+                ->pluck('id');
+        }, 5);
+
+        if ($ids->isEmpty()) {
+            // Курсор исчерпан — конец таблицы. count() мог врать/устареть.
+            return self::markPendingFinalize($state);
+        }
+
+        $products = Database::retry(function () use ($ids) {
             Database::reconnect();
 
             return Product::query()
@@ -223,54 +299,10 @@ class ProductFeedService
                     'categories.parentCategory:id,name,parent_id',
                     'images:id,product_id,src',
                 ])
-                ->where('id', '>', $afterId)
+                ->whereIn('id', $ids->all())
                 ->orderBy('id')
-                ->limit(self::PAGE_SIZE)
                 ->get();
         }, 5);
-
-        $total = (int) ($state['total'] ?? 0);
-        $processed = (int) ($state['processed'] ?? 0);
-
-        if ($products->isEmpty()) {
-            // Пустая страница при незавершённом каталоге = обрыв MySQL, НЕ конец.
-            if ($total > 0 && $processed < $total) {
-                Log::channel('single')->warning('product-feeds: empty page too early, retry same cursor', [
-                    'after_id' => $afterId,
-                    'processed' => $processed,
-                    'total' => $total,
-                ]);
-
-                // Ещё одна попытка того же курсора (reconnect уже был в retry).
-                $products = Database::retry(function () use ($afterId) {
-                    usleep(250000);
-                    Database::reconnect();
-
-                    return Product::query()
-                        ->with([
-                            'categories:id,name,url,parent_id',
-                            'categories.parentCategory:id,name,parent_id',
-                            'images:id,product_id,src',
-                        ])
-                        ->where('id', '>', $afterId)
-                        ->orderBy('id')
-                        ->limit(self::PAGE_SIZE)
-                        ->get();
-                }, 5);
-            }
-
-            if ($products->isEmpty()) {
-                if ($total > 0 && $processed < $total) {
-                    $state['status'] = 'failed';
-                    $state['error'] = "Обрыв загрузки на {$processed} из {$total} (пустая страница). Запустите сборку снова.";
-                    self::saveBuildState($state);
-
-                    return $state;
-                }
-
-                return self::markPendingFinalize($state);
-            }
-        }
 
         $lines = [];
 
@@ -293,42 +325,26 @@ class ProductFeedService
             $lines[] = json_encode($row, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         }
 
+        // Если whereIn вернул меньше id (редкий глюк) — всё равно двигаем курсор.
+        $state['after_id'] = max((int) $state['after_id'], (int) $ids->last());
+
         $state['page'] = (int) ($state['page'] ?? 0) + 1;
         $state['pages_total'] = max(
             (int) ($state['pages_total'] ?? 1),
-            (int) $state['page'],
+            (int) ceil(max(1, (int) ($state['total'] ?? 1)) / self::PAGE_SIZE),
         );
 
         $total = (int) ($state['total'] ?? 0);
         $processed = (int) ($state['processed'] ?? 0);
         if ($total > 0) {
-            // До 96% на обходе каталога; 97–99 — финализация отдельным тиком.
             $state['percent'] = min(96, (int) floor($processed / $total * 96));
         } else {
-            $state['percent'] = min(96, (int) $state['page'] * 4);
+            $state['percent'] = min(96, (int) $state['page'] * 3);
         }
 
         if ($lines !== []) {
             $path = Storage::disk('public')->path($state['build_dir'].'/items.jsonl');
             file_put_contents($path, implode("\n", $lines)."\n", FILE_APPEND | LOCK_EX);
-        }
-
-        // Неполная страница = конец ТОЛЬКО если добрали почти весь каталог
-        // (или total неизвестен). Иначе это подозрительный обрыв.
-        $isShortPage = $products->count() < self::PAGE_SIZE;
-        $reachedEnd = $total <= 0 || $processed >= $total || ($total > 0 && $processed >= (int) floor($total * 0.98));
-
-        if ($isShortPage && $reachedEnd) {
-            return self::markPendingFinalize($state);
-        }
-
-        if ($isShortPage && $total > 0 && $processed < $total) {
-            Log::channel('single')->warning('product-feeds: short page before end, continue', [
-                'got' => $products->count(),
-                'processed' => $processed,
-                'total' => $total,
-                'after_id' => $state['after_id'],
-            ]);
         }
 
         self::saveBuildState($state);
@@ -342,23 +358,9 @@ class ProductFeedService
      */
     protected static function markPendingFinalize(array $state): array
     {
-        $total = (int) ($state['total'] ?? 0);
         $processed = (int) ($state['processed'] ?? 0);
         $included = (int) ($state['included'] ?? 0);
-
-        // Защита от «успешной» финализации после 1 страницы при живом каталоге.
-        if ($total > 100 && $processed < (int) floor($total * 0.9)) {
-            $state['status'] = 'failed';
-            $state['error'] = "Сборка оборвалась рано: обработано {$processed} из {$total}. Запустите снова.";
-            self::saveBuildState($state);
-            Log::channel('single')->error('product-feeds: refuse early finalize', [
-                'processed' => $processed,
-                'included' => $included,
-                'total' => $total,
-            ]);
-
-            return $state;
-        }
+        $total = (int) ($state['total'] ?? 0);
 
         if ($total <= 0) {
             $state['total'] = $processed;
@@ -372,6 +374,7 @@ class ProductFeedService
         Log::channel('single')->info('product-feeds: pending finalize', [
             'processed' => $processed,
             'included' => $included,
+            'total' => $state['total'],
         ]);
 
         return $state;
@@ -619,6 +622,12 @@ class ProductFeedService
     }
 
     public static function cancelBuild(): void
+    {
+        Cache::put(self::CANCEL_FLAG_KEY, true, now()->addMinutes(30));
+        self::resetBuildArtifacts();
+    }
+
+    protected static function resetBuildArtifacts(): void
     {
         $state = Cache::get(self::BUILD_CACHE_KEY);
         if (is_array($state) && ! empty($state['build_dir'])) {

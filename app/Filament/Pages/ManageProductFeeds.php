@@ -166,7 +166,7 @@ class ManageProductFeeds extends Page
                 Section::make('Правила фида')
                     ->collapsed()
                     ->schema([
-                        Text::make('Сборка идёт постранично (по '.ProductFeedService::PAGE_SIZE.' товаров × 2 страницы за тик), чтобы не упираться в таймаут PHP. ID товара стабильный, артикул → mpn.')
+                        Text::make('Сборка запускается фоном через artisan (без таймаута Livewire). ID товара стабильный, артикул → mpn.')
                             ->size(TextSize::Small)
                             ->color('gray'),
                         Text::make(fn (): string => $this->filesHint())
@@ -217,23 +217,23 @@ class ManageProductFeeds extends Page
                 ->color('primary')
                 ->disabled(fn (): bool => $this->isBuilding)
                 ->requiresConfirmation()
-                ->modalHeading('Постраничная сборка фидов')
-                ->modalDescription('Каталог обрабатывается порциями по '.ProductFeedService::PAGE_SIZE.' товаров. Прогресс — в блоке «Сборка фидов» на странице.')
+                ->modalHeading('Собрать фиды заново?')
+                ->modalDescription('Сборка запускается в фоне (artisan). Страницу можно не держать открытой, но прогресс удобнее смотреть здесь.')
                 ->successNotification(null)
-                ->action(fn () => $this->startPaginatedBuild()),
+                ->action(fn () => $this->startBackgroundBuild()),
         ];
     }
 
-    public function startPaginatedBuild(): void
+    public function startBackgroundBuild(): void
     {
         try {
-            $state = ProductFeedService::startBuild();
+            ProductFeedService::runInBackground();
         } catch (Throwable $e) {
-            Log::channel('single')->error('product-feeds: start failed', [
+            Log::channel('single')->error('product-feeds: background start failed', [
                 'message' => $e->getMessage(),
             ]);
             Notification::make()
-                ->title('Не удалось начать сборку')
+                ->title('Не удалось запустить сборку')
                 ->body(Str::limit($e->getMessage() ?: $e::class, 400))
                 ->danger()
                 ->persistent()
@@ -242,12 +242,13 @@ class ManageProductFeeds extends Page
             return;
         }
 
-        $this->applyBuildState($state);
         $this->isBuilding = true;
+        $this->buildPercent = 1;
+        $this->buildLabel = 'Фоновый процесс запущен…';
 
         Notification::make()
-            ->title('Сборка запущена')
-            ->body('Каталог обрабатывается по страницам — не закрывайте вкладку.')
+            ->title('Сборка запущена в фоне')
+            ->body('Прогресс обновляется автоматически. Обычно 20–40 секунд.')
             ->info()
             ->send();
 
@@ -255,6 +256,8 @@ class ManageProductFeeds extends Page
     }
 
     /**
+     * Только читает статус фонового процесса (не грузит товары в Livewire).
+     *
      * @return bool true = сборка завершена (остановить poll)
      */
     public function tickBuild(): bool
@@ -263,22 +266,10 @@ class ManageProductFeeds extends Page
             return true;
         }
 
-        try {
-            // По 1 странице за тик; финализация XML — отдельным тиком после pending_finalize.
-            $state = ProductFeedService::processNextPages(1);
-        } catch (Throwable $e) {
-            $this->isBuilding = false;
-            Log::channel('single')->error('product-feeds: tick failed', [
-                'message' => $e->getMessage(),
-            ]);
-            Notification::make()
-                ->title('Ошибка сборки фидов')
-                ->body(Str::limit($e->getMessage() ?: $e::class, 400))
-                ->danger()
-                ->persistent()
-                ->send();
-
-            return true;
+        $state = ProductFeedService::buildStatus();
+        if ($state === null) {
+            // Ещё не успел стартовать CLI или уже очищен.
+            return false;
         }
 
         $this->applyBuildState($state);
@@ -343,7 +334,7 @@ class ManageProductFeeds extends Page
         }
 
         $status = (string) ($state['status'] ?? '');
-        if (in_array($status, ['running', 'pending_finalize', 'finalizing'], true)) {
+        if (in_array($status, ['queued', 'running', 'pending_finalize', 'finalizing'], true)) {
             $this->isBuilding = true;
             $this->applyBuildState($state);
         }
@@ -363,10 +354,11 @@ class ManageProductFeeds extends Page
 
         $status = (string) ($state['status'] ?? '');
         $this->buildLabel = match ($status) {
-            'pending_finalize' => 'Каталог собран — следующий шаг: запись XML/CSV…',
+            'queued' => 'Ожидание фонового процесса…',
+            'pending_finalize' => 'Каталог собран — запись XML/CSV…',
             'finalizing' => 'Запись Google XML и Facebook CSV…',
             'done' => 'Готово',
-            'failed' => 'Ошибка',
+            'failed' => 'Ошибка: '.Str::limit((string) ($state['error'] ?? ''), 120),
             default => sprintf(
                 'Страница %d из %d · обработано %d / %d · в фид %d',
                 $this->buildPage,
