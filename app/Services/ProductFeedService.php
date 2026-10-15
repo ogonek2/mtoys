@@ -4,7 +4,6 @@ namespace App\Services;
 
 use App\Helpers\FileUploadHelper;
 use App\Models\Product;
-use App\Models\productImage;
 use App\Support\Database;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -14,7 +13,7 @@ use RuntimeException;
 use Throwable;
 
 /**
- * Простая генерация фидов: читаем товары из БД порциями и сразу пишем файлы.
+ * Лёгкая генерация фидов: только нужные колонки, короткие тексты, без «простыней» description.
  */
 class ProductFeedService
 {
@@ -27,6 +26,17 @@ class ProductFeedService
     public const META_CACHE_KEY = 'product-feeds.meta';
 
     public const DIRTY_CACHE_KEY = 'product-feeds.dirty';
+
+    /** Лимиты под Merchant/Meta и чтобы не раздувать XML. */
+    private const TITLE_MAX = 100;
+
+    private const DESCRIPTION_MAX = 500;
+
+    private const BRAND_MAX = 50;
+
+    private const EXTRA_IMAGES_MAX = 2;
+
+    private const CHUNK = 50;
 
     public static function schedule(): void
     {
@@ -51,7 +61,7 @@ class ProductFeedService
     {
         @set_time_limit(0);
         @ini_set('max_execution_time', '0');
-        @ini_set('memory_limit', '512M');
+        @ini_set('memory_limit', '256M');
 
         $started = microtime(true);
         Log::channel('single')->info('product-feeds: generate start');
@@ -77,7 +87,7 @@ class ProductFeedService
         fwrite($g, "  <channel>\n");
         fwrite($g, '    <title>'.self::xmlEscape($storeName)."</title>\n");
         fwrite($g, '    <link>'.self::xmlEscape($siteUrl)."</link>\n");
-        fwrite($g, '    <description>'.self::xmlEscape($storeName.' — товарный фид Google Merchant')."</description>\n");
+        fwrite($g, '    <description>'.self::xmlEscape($storeName.' product feed')."</description>\n");
 
         fwrite($f, "\xEF\xBB\xBF");
         fputcsv($f, [
@@ -96,16 +106,37 @@ class ProductFeedService
         ];
         $lastId = 0;
 
+        // Не тянем description / characteristics / JSON — только короткие поля.
+        $columns = [
+            'id',
+            'name',
+            'articule',
+            'price',
+            'discount',
+            'discount_starts_at',
+            'discount_ends_at',
+            'image_path',
+            'url',
+            'availability',
+            'condition_item',
+            'brand',
+            'seo_description',
+        ];
+
         try {
             while (true) {
-                $products = Database::retry(function () use ($lastId) {
+                $products = Database::retry(function () use ($lastId, $columns) {
                     Database::reconnect();
 
                     return Product::query()
-                        ->with(['categories.parentCategory', 'images'])
+                        ->select($columns)
+                        ->with([
+                            'categories:id,name,url',
+                            'images:id,product_id,src',
+                        ])
                         ->where('id', '>', $lastId)
                         ->orderBy('id')
-                        ->limit(100)
+                        ->limit(self::CHUNK)
                         ->get();
                 }, 5);
 
@@ -117,7 +148,7 @@ class ProductFeedService
                     $lastId = (int) $product->id;
                     $total++;
 
-                    $row = self::mapProduct($product);
+                    $row = self::mapProduct($product, $storeName);
                     if ($row === null) {
                         $excluded++;
                         $reason = self::$lastSkipReason ?? 'no_image';
@@ -131,6 +162,19 @@ class ProductFeedService
                     $included++;
                     self::writeGoogleItem($g, $row);
                     self::writeFacebookRow($f, $row);
+                }
+
+                // Сброс памяти между порциями.
+                unset($products);
+                if (function_exists('gc_collect_cycles')) {
+                    gc_collect_cycles();
+                }
+
+                if ($total % 200 === 0) {
+                    Log::channel('single')->info('product-feeds: progress', [
+                        'processed' => $total,
+                        'included' => $included,
+                    ]);
                 }
             }
         } catch (Throwable $e) {
@@ -153,7 +197,6 @@ class ProductFeedService
         self::replaceFile(self::DIR.'/'.self::FACEBOOK_FILE, $facebookTmp);
 
         Cache::forget(self::DIRTY_CACHE_KEY);
-        // Старый UI-прогресс / фоновые стейты больше не нужны.
         Cache::forget('product-feeds.build');
         Cache::forget('product-feeds.cancel');
 
@@ -174,7 +217,9 @@ class ProductFeedService
         Log::channel('single')->info('product-feeds: generate done', [
             'count' => $included,
             'total' => $total,
+            'excluded' => $excluded,
             'seconds' => round(microtime(true) - $started, 2),
+            'google_kb' => round($meta['google_bytes'] / 1024, 1),
         ]);
 
         return $meta;
@@ -273,11 +318,11 @@ class ProductFeedService
     /**
      * @return array<string, mixed>|null
      */
-    protected static function mapProduct(Product $product): ?array
+    protected static function mapProduct(Product $product, string $storeName): ?array
     {
         self::$lastSkipReason = null;
 
-        $title = self::cleanText((string) $product->name, 150);
+        $title = self::cleanText((string) $product->name, self::TITLE_MAX);
         if ($title === '') {
             self::$lastSkipReason = 'no_name';
 
@@ -331,22 +376,27 @@ class ProductFeedService
             default => 'new',
         };
 
-        $brand = self::cleanText((string) ($product->brand ?: ShopSettings::get('store_name') ?: 'Mtoys'), 70);
-        $mpn = self::cleanText((string) ($product->articule ?? ''), 70);
-        $productType = self::categoryPath($category);
-        $description = self::plainDescription($product, $title, $brand, $productType);
+        $brand = self::cleanText((string) ($product->brand ?: $storeName), self::BRAND_MAX);
+        if ($brand === '') {
+            $brand = 'Mtoys';
+        }
+
+        $mpn = self::cleanText((string) ($product->articule ?? ''), 40);
+        // Только seo_description или название — полный description из БД НЕ читаем.
+        $description = self::feedDescription($product, $title, $brand, $category?->name);
 
         $additionalImages = [];
         foreach ($product->images as $imageRow) {
-            /** @var productImage $imageRow */
-            $url = self::toFeedImageUrl($imageRow->src);
+            $url = self::toFeedImageUrl($imageRow->src ?? null);
             if ($url !== null && $url !== $image && ! in_array($url, $additionalImages, true)) {
                 $additionalImages[] = $url;
             }
-            if (count($additionalImages) >= 10) {
+            if (count($additionalImages) >= self::EXTRA_IMAGES_MAX) {
                 break;
             }
         }
+
+        $productType = self::cleanText((string) ($category?->name ?? ''), 100);
 
         return [
             'id' => (string) $product->id,
@@ -360,28 +410,37 @@ class ProductFeedService
             'condition' => $condition,
             'price' => number_format($price, 2, '.', '').' UAH',
             'sale_price' => $salePrice !== null ? number_format($salePrice, 2, '.', '').' UAH' : null,
-            'brand' => $brand !== '' ? $brand : 'Mtoys',
+            'brand' => $brand,
             'mpn' => $mpn !== '' ? $mpn : null,
             'identifier_exists' => $mpn !== '',
-            'product_type' => $productType,
+            'product_type' => $productType !== '' ? $productType : null,
         ];
+    }
+
+    protected static function feedDescription(Product $product, string $title, string $brand, ?string $categoryName): string
+    {
+        $seo = self::cleanText((string) ($product->seo_description ?? ''), self::DESCRIPTION_MAX);
+        if ($seo !== '') {
+            return $seo;
+        }
+
+        $parts = array_filter([$title, $brand !== '' ? $brand : null, $categoryName]);
+
+        return self::cleanText(implode('. ', $parts), self::DESCRIPTION_MAX);
     }
 
     protected static function resolveImageUrl(Product $product): ?string
     {
-        $candidates = [];
         $main = trim((string) $product->image_path);
         if ($main !== '') {
-            $candidates[] = $main;
-        }
-        foreach ($product->images as $imageRow) {
-            $src = trim((string) $imageRow->src);
-            if ($src !== '') {
-                $candidates[] = $src;
+            $url = self::toFeedImageUrl($main);
+            if ($url !== null) {
+                return $url;
             }
         }
-        foreach ($candidates as $candidate) {
-            $url = self::toFeedImageUrl($candidate);
+
+        foreach ($product->images as $imageRow) {
+            $url = self::toFeedImageUrl($imageRow->src ?? null);
             if ($url !== null) {
                 return $url;
             }
@@ -432,11 +491,24 @@ class ProductFeedService
 
     protected static function cleanText(string $value, int $limit): string
     {
+        // Убираем HTML, скрипты, лишние пробелы; режем жёстко.
+        $value = preg_replace('#<script\b[^>]*>.*?</script>#is', ' ', $value) ?? $value;
+        $value = preg_replace('#<style\b[^>]*>.*?</style>#is', ' ', $value) ?? $value;
         $value = html_entity_decode(strip_tags($value), ENT_QUOTES | ENT_HTML5, 'UTF-8');
         $value = preg_replace('/\s+/u', ' ', $value) ?? $value;
         $value = trim($value);
 
-        return $value === '' ? '' : Str::limit($value, $limit, '');
+        if ($value === '') {
+            return '';
+        }
+
+        // Обрезаем очень длинные «слова» (base64 и т.п.).
+        if (preg_match('/\S{200,}/u', $value)) {
+            $value = preg_replace('/\S{200,}/u', ' ', $value) ?? $value;
+            $value = trim(preg_replace('/\s+/u', ' ', $value) ?? $value);
+        }
+
+        return Str::limit($value, $limit, '');
     }
 
     protected static function isDiscountActive(Product $product): bool
@@ -450,41 +522,6 @@ class ProductFeedService
         }
 
         return true;
-    }
-
-    protected static function plainDescription(Product $product, string $title, string $brand, ?string $productType): string
-    {
-        $raw = trim((string) ($product->description ?: $product->seo_description ?: ''));
-        $text = self::cleanText($raw, 5000);
-        if (mb_strlen($text) < 30) {
-            $text = trim(implode('. ', array_filter([
-                $title,
-                $brand !== '' ? 'Бренд: '.$brand : null,
-                $productType,
-            ])));
-        }
-
-        return Str::limit($text !== '' ? $text : $title, 5000, '');
-    }
-
-    protected static function categoryPath(mixed $category): ?string
-    {
-        if ($category === null) {
-            return null;
-        }
-        $parts = [];
-        $current = $category;
-        $guard = 0;
-        while ($current && $guard < 8) {
-            $name = trim((string) $current->name);
-            if ($name !== '') {
-                array_unshift($parts, $name);
-            }
-            $current = $current->parentCategory ?? null;
-            $guard++;
-        }
-
-        return $parts === [] ? null : implode(' > ', $parts);
     }
 
     protected static function xmlEscape(string $value): string
