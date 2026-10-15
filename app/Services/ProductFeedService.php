@@ -229,8 +229,47 @@ class ProductFeedService
                 ->get();
         }, 5);
 
+        $total = (int) ($state['total'] ?? 0);
+        $processed = (int) ($state['processed'] ?? 0);
+
         if ($products->isEmpty()) {
-            return self::markPendingFinalize($state);
+            // Пустая страница при незавершённом каталоге = обрыв MySQL, НЕ конец.
+            if ($total > 0 && $processed < $total) {
+                Log::channel('single')->warning('product-feeds: empty page too early, retry same cursor', [
+                    'after_id' => $afterId,
+                    'processed' => $processed,
+                    'total' => $total,
+                ]);
+
+                // Ещё одна попытка того же курсора (reconnect уже был в retry).
+                $products = Database::retry(function () use ($afterId) {
+                    usleep(250000);
+                    Database::reconnect();
+
+                    return Product::query()
+                        ->with([
+                            'categories:id,name,url,parent_id',
+                            'categories.parentCategory:id,name,parent_id',
+                            'images:id,product_id,src',
+                        ])
+                        ->where('id', '>', $afterId)
+                        ->orderBy('id')
+                        ->limit(self::PAGE_SIZE)
+                        ->get();
+                }, 5);
+            }
+
+            if ($products->isEmpty()) {
+                if ($total > 0 && $processed < $total) {
+                    $state['status'] = 'failed';
+                    $state['error'] = "Обрыв загрузки на {$processed} из {$total} (пустая страница). Запустите сборку снова.";
+                    self::saveBuildState($state);
+
+                    return $state;
+                }
+
+                return self::markPendingFinalize($state);
+            }
         }
 
         $lines = [];
@@ -261,9 +300,10 @@ class ProductFeedService
         );
 
         $total = (int) ($state['total'] ?? 0);
+        $processed = (int) ($state['processed'] ?? 0);
         if ($total > 0) {
             // До 96% на обходе каталога; 97–99 — финализация отдельным тиком.
-            $state['percent'] = min(96, (int) floor(((int) $state['processed'] / $total) * 96));
+            $state['percent'] = min(96, (int) floor($processed / $total * 96));
         } else {
             $state['percent'] = min(96, (int) $state['page'] * 4);
         }
@@ -273,9 +313,22 @@ class ProductFeedService
             file_put_contents($path, implode("\n", $lines)."\n", FILE_APPEND | LOCK_EX);
         }
 
-        // Последняя (неполная) страница — на следующем тике только XML/CSV.
-        if ($products->count() < self::PAGE_SIZE) {
+        // Неполная страница = конец ТОЛЬКО если добрали почти весь каталог
+        // (или total неизвестен). Иначе это подозрительный обрыв.
+        $isShortPage = $products->count() < self::PAGE_SIZE;
+        $reachedEnd = $total <= 0 || $processed >= $total || ($total > 0 && $processed >= (int) floor($total * 0.98));
+
+        if ($isShortPage && $reachedEnd) {
             return self::markPendingFinalize($state);
+        }
+
+        if ($isShortPage && $total > 0 && $processed < $total) {
+            Log::channel('single')->warning('product-feeds: short page before end, continue', [
+                'got' => $products->count(),
+                'processed' => $processed,
+                'total' => $total,
+                'after_id' => $state['after_id'],
+            ]);
         }
 
         self::saveBuildState($state);
@@ -289,8 +342,26 @@ class ProductFeedService
      */
     protected static function markPendingFinalize(array $state): array
     {
-        if ((int) ($state['total'] ?? 0) <= 0) {
-            $state['total'] = (int) ($state['processed'] ?? 0);
+        $total = (int) ($state['total'] ?? 0);
+        $processed = (int) ($state['processed'] ?? 0);
+        $included = (int) ($state['included'] ?? 0);
+
+        // Защита от «успешной» финализации после 1 страницы при живом каталоге.
+        if ($total > 100 && $processed < (int) floor($total * 0.9)) {
+            $state['status'] = 'failed';
+            $state['error'] = "Сборка оборвалась рано: обработано {$processed} из {$total}. Запустите снова.";
+            self::saveBuildState($state);
+            Log::channel('single')->error('product-feeds: refuse early finalize', [
+                'processed' => $processed,
+                'included' => $included,
+                'total' => $total,
+            ]);
+
+            return $state;
+        }
+
+        if ($total <= 0) {
+            $state['total'] = $processed;
         }
 
         $state['status'] = 'pending_finalize';
@@ -299,8 +370,8 @@ class ProductFeedService
         self::saveBuildState($state);
 
         Log::channel('single')->info('product-feeds: pending finalize', [
-            'processed' => $state['processed'] ?? 0,
-            'included' => $state['included'] ?? 0,
+            'processed' => $processed,
+            'included' => $included,
         ]);
 
         return $state;
